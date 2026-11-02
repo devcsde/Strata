@@ -949,19 +949,23 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         if (s.n_rot == 64)   // the native and prompt-path rope kernels read it (mrope.hpp, STRATA_ROPE_TABLE=1)
             strata::kernels::rope_table_set(st.cos_tab, st.sin_tab, (int) max_cells, strata::kernels::rope_scaling());
     }
+    qsa_state_restore_tables(st);
+    return c.used;
+}
+
+void qsa_state_restore_tables(const QsaState& st) {
     // the page table starts as the IDENTITY, which is the simplest legal mapping and what a caller that does
     // not page at all wants; a streamed state starts with nothing resident, a ring at `block % n_slots`.
-    if (p.mode == 0) {
-        std::vector<int32_t> tab((size_t) pages);
-        for (int64_t i = 0; i < pages; ++i) tab[(size_t) i] = (int32_t) i;
+    if (st.kv_mode == 0) {
+        std::vector<int32_t> tab((size_t) st.n_pages);
+        for (int64_t i = 0; i < st.n_pages; ++i) tab[(size_t) i] = (int32_t) i;
         cudaMemcpy(st.page_table, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice);
-    } else if (p.mode == 1) {
+    } else if (st.kv_mode == 1) {
         strata::kernels::kv_stream_reset(st.map, nullptr);
     } else {
-        strata::kernels::kv_ring_table(st.page_table, pages, p.slots, nullptr);
+        strata::kernels::kv_ring_table(st.page_table, st.n_pages, st.n_slots, nullptr);
     }
     cudaDeviceSynchronize();
-    return c.used;
 }
 
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {

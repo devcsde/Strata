@@ -98,8 +98,12 @@ struct SessionState {
 uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo = 0,
                        int64_t layer_hi = -1);
 /// Carves `base` (DEVICE memory) into `s`.  Returns the bytes used.  Same range convention as `session_bytes`.
+/// `share_rope`: read this state's RoPE table instead of building one in `base` (null, the default: build it).
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
-                      int64_t layer_lo = 0, int64_t layer_hi = -1);
+                      int64_t layer_lo = 0, int64_t layer_hi = -1, const QsaState* share_rope = nullptr);
+/// STRATA_BATCH_LAZY: writes again the device tables only `session_init` writes (the QSA page tables), which
+/// `session_zero` leaves alone.  For a session whose memory held something else in between.
+void session_restore_tables(SessionState& s);
 /// Before the memory `session_init` carved is freed: forgets what points into it from outside the session (the
 /// rope kernels' registered angle table, #280), so a later session never rotates by freed memory.
 void session_release(SessionState& s);

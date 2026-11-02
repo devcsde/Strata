@@ -6157,7 +6157,24 @@ int main(int argc, char** argv) {
                              "one group\n", o.batch_groups, o.batch);
         o.batch_groups = 1;
     }
-    if (o.batch > 0) {
+    // STRATA_BATCH_LAZY=1 (opt-in, docs/BATCHING.md): the slot sessions take no VRAM of their own.  They are carved in the
+    // tail of the expert cache (below, before its fill), which holds experts until a request needs a slot.
+    bool batch_lazy = false;
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_GPU_METAL)
+    if (const char* lz = std::getenv("STRATA_BATCH_LAZY"); lz != nullptr && lz[0] != '\0' && lz[0] != '0' && o.batch > 0) {
+        const char* why = batch_mtp ? "--batch-mtp"
+                        : multi_gpu || !stages.empty() ? "a layer split"
+                        : o.peer_device >= 0 ? "--peer-device"
+                        : o.vram_elastic ? "--vram-elastic"
+                        : o.expert_cache_per_layer ? "--expert-cache-per-layer"
+                        : o.expert_cache == 0 ? "no expert cache" : nullptr;
+        if (why != nullptr) std::fprintf(stderr, "strata generate: STRATA_BATCH_LAZY is off: not with %s\n", why);
+        else batch_lazy = true;
+    }
+#endif
+    if (batch_lazy) {
+        bslot_ss.resize(1);
+    } else if (o.batch > 0) {
         bslot_ss.resize(1 + stages.size());
         int fit = o.batch;   // the slots every stage could carve
         uint64_t bytes0 = 0;
@@ -7274,6 +7291,39 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "                 compulsory-miss (fills with whatever the run routes first).\n");
         } else {
             std::fprintf(stderr, "                 PROFILE, ranked by routing frequency, no eviction.\n");
+        }
+    }
+    // STRATA_BATCH_LAZY: carve the slot sessions in the cache's tail BEFORE the fill: the carve writes each QSA layer's
+    // page table there, and that must not land on experts.  Their addresses never change, so the batch graphs stay
+    // valid.  The RoPE table is the main session's: nothing else keeps it safe while experts fill the tail.
+    int64_t batch_lazy_keep = 0;     // the slots left to experts while the slots are in use
+    if (batch_lazy) {
+        const uint64_t stride = (strata::core::session_bytes(g, o.max_context, K) + 4095) & ~(uint64_t) 4095;
+        const int64_t need = (int64_t) stride * o.batch;
+        const int64_t from = (xcache.valid() ? xcache.full_bytes() - need : 0) & ~((int64_t) (1 << 20) - 1);
+        batch_lazy_keep = from > 0 ? xcache.slots_within(from) : 0;
+        if (batch_lazy_keep < 512) {
+            std::fprintf(stderr, "strata generate: WARNING: STRATA_BATCH_LAZY: %d slot sessions (%.2f GiB) leave the expert "
+                                 "cache %lld slots; --batch is off\n", o.batch, (double) need / 1073741824.0,
+                         (long long) batch_lazy_keep);
+            bslot_ss.clear();
+            o.batch = 0;
+            batch_lazy = false;
+        } else {
+            const strata::core::QsaState* rope = g.n_qsa_layers() > 0 ? &ss.qsa_states[ss.qsa_ord0] : nullptr;
+            for (int b = 0; b < o.batch; ++b) {
+                auto u = std::make_unique<strata::core::SessionState>();
+                if (strata::core::session_init(g, o.max_context, K, xcache.device_slot(0) + from + (int64_t) stride * b, *u,
+                                               0, -1, rope) == 0) {
+                    std::fprintf(stderr, "strata generate: STRATA_BATCH_LAZY: slot %d's session could not be carved\n", b);
+                    return 1;
+                }
+                bslot_ss[0].push_back(std::move(u));
+            }
+            cudaDeviceSynchronize();
+            std::fprintf(stderr, "strata generate: --batch %d on demand: the slot sessions (%.2f GiB each) use the expert "
+                                 "cache's tail only while slots are in use: %lld slots then, %lld otherwise\n", o.batch,
+                         (double) stride / 1073741824.0, (long long) batch_lazy_keep, (long long) xcache.full_slots());
         }
     }
     // ---- R4.2e: fill the tier from the profile.  This is the only place the plan is applied, and it runs
@@ -10217,6 +10267,13 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        // STRATA_BATCH_LAZY puts the tail's experts back from RAM, and in the low-RAM mode the cache holds experts RAM does not
+        if (batch_lazy && src.complement_ready()) {
+            std::fprintf(stderr, "strata serve: WARNING: STRATA_BATCH_LAZY: not with the resident low-RAM mode; --batch is off\n");
+            bslot_ss.clear();
+            o.batch = 0;
+            batch_lazy = false;
+        }
         // each stage's verifier gets its stage's slot sessions
         if (o.batch > 0) {
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
@@ -12395,10 +12452,56 @@ int main(int argc, char** argv) {
                 return k > 0 && k + 128 <= live && !(o.prefill_auto && k * 100 > kAutoLendPct * live);
             };
             int64_t c = chunk_full;
-            while (c > 256 && !fits(c)) c = std::max<int64_t>(256, c / 2 / 256 * 256);
+            // (STRATA_BATCH_LAZY: in steps of 256, so the slots' prompt chunk is what the auto chunk would pick for that cache)
+            while (c > 256 && !fits(c)) c = std::max<int64_t>(256, batch_lazy ? c - 256 : c / 2 / 256 * 256);
             o.prefill_chunk = c;
             p.first = (int32_t) std::max<int64_t>(0, live - part_slots(p, c));
             p.first_now = -1;   // laid out again at the next loan
+        };
+        // the experts past `slots()` become CPU misses, as any expert outside the cache is
+        auto cache_evict_past_live = [&]() {
+            const int64_t live = xcache.slots();
+            for (size_t i = 0; i < host_res.size(); ++i)
+                if (host_res[i] >= live) {
+                    vram_evicted.emplace_back((int32_t) i, host_res[i]);
+                    host_res[i] = strata::core::kNotResident;
+                }
+            res_upload();
+        };
+        // each slot back in `slots()` gets its expert (or, when the adaptive tier already brought that one back, the
+        // most-routed missing expert of the same layer)
+        auto cache_refill_evicted = [&](std::string& e) -> bool {
+            const int64_t live = xcache.slots();
+            std::string ferr;
+            std::vector<std::pair<int32_t, int32_t>> keep_out;
+            for (const auto& [i, slot] : vram_evicted) {
+                if (slot >= live) { keep_out.emplace_back(i, slot); continue; }
+                const int64_t layer = i / g.n_expert;
+                int64_t pick = i;
+                if (host_res[(size_t) i] >= 0) {   // back already (the adaptive tier): the layer's most-routed miss
+                    pick = -1;
+                    float best = -1.0f;
+                    for (int64_t ex = 0; ex < g.n_expert; ++ex) {
+                        const size_t j = (size_t) (layer * g.n_expert + ex);
+                        if (host_res[j] >= 0) continue;
+                        const float u = drive.d.usage.empty() ? 0.0f : drive.d.usage[j];
+                        if (u > best) { best = u; pick = (int64_t) j; }
+                    }
+                }
+                if (pick < 0) continue;
+                const uint8_t* b = srcp->blob_stable(layer, pick % g.n_expert);
+                if (b == nullptr || !xcache.fill_slot_queued(slot, b, ferr,
+                        (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer))) {
+                    e = "VRAM: refilling the cache failed: " + ferr;
+                    return false;
+                }
+                srcp->note_async_read(b, nullptr);   // #1237: the queued copy reads a stage buffer; it is not recycled under it
+                host_res[(size_t) pick] = slot;
+            }
+            vram_evicted.swap(keep_out);
+            if (!xcache.sync_queued(ferr)) { e = "VRAM: " + ferr; return false; }
+            res_upload();
+            return true;
         };
         auto vram_command = [&](const std::string& cmd, std::string& e) -> bool {
             // `VRAM` alone: the reserve the engine started with (--vram-reserve-mib)
@@ -12440,46 +12543,11 @@ int main(int argc, char** argv) {
                     note = " (the cache keeps its smallest size: the prompt path's buffers)";
                 }
                 if (!xcache.shrink(keep, e)) return false;
-                const int64_t live = xcache.slots();
-                for (size_t i = 0; i < host_res.size(); ++i)
-                    if (host_res[i] >= live) {
-                        vram_evicted.emplace_back((int32_t) i, host_res[i]);
-                        host_res[i] = strata::core::kNotResident;
-                    }
-                res_upload();
+                cache_evict_past_live();
             } else if (mapped < xcache.full_bytes()) {
                 std::string gerr;
                 if (!xcache.grow(mapped + ((int64_t) free_b - want_free), gerr)) note = " (" + gerr + ")";
-                const int64_t live = xcache.slots();
-                std::string ferr;
-                std::vector<std::pair<int32_t, int32_t>> keep_out;
-                for (const auto& [i, slot] : vram_evicted) {
-                    if (slot >= live) { keep_out.emplace_back(i, slot); continue; }
-                    const int64_t layer = i / g.n_expert;
-                    int64_t pick = i;
-                    if (host_res[(size_t) i] >= 0) {   // back already (the adaptive tier): the layer's most-routed miss
-                        pick = -1;
-                        float best = -1.0f;
-                        for (int64_t ex = 0; ex < g.n_expert; ++ex) {
-                            const size_t j = (size_t) (layer * g.n_expert + ex);
-                            if (host_res[j] >= 0) continue;
-                            const float u = drive.d.usage.empty() ? 0.0f : drive.d.usage[j];
-                            if (u > best) { best = u; pick = (int64_t) j; }
-                        }
-                    }
-                    if (pick < 0) continue;
-                    const uint8_t* b = srcp->blob_stable(layer, pick % g.n_expert);
-                    if (b == nullptr || !xcache.fill_slot_queued(slot, b, ferr,
-                            (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer))) {
-                        e = "VRAM: refilling the cache failed: " + ferr;
-                        return false;
-                    }
-                    srcp->note_async_read(b, nullptr);   // #1237: the queued copy reads a stage buffer; it is not recycled under it
-                    host_res[(size_t) pick] = slot;
-                }
-                vram_evicted.swap(keep_out);
-                if (!xcache.sync_queued(ferr)) { e = "VRAM: " + ferr; return false; }
-                res_upload();
+                if (!cache_refill_evicted(e)) return false;
             }
             relend();
             cudaMemGetInfo(&free_b, &total_b);
@@ -12574,6 +12642,67 @@ int main(int argc, char** argv) {
         struct CoReq { int slot = -1; std::vector<int64_t> ids; };
         std::vector<CoReq> co_pending, co_set;
         auto batch_on = [&] { for (const BSlot& b : bs) if (b.active) return true; return false; };
+        // ---- STRATA_BATCH_LAZY: the slots' sessions and the experts share the cache's tail.  A request that needs a slot
+        // takes the tail from the experts; a later request with no slot in use for the grace time gives it back.  Both
+        // run between requests (no loan out, nothing in flight), as the VRAM command does.
+        bool lazy_active = false;
+        Clock::time_point lazy_last_busy = Clock::now();
+        static const double lazy_grace_s = [] {
+            const char* v = std::getenv("STRATA_BATCH_LAZY_GRACE_S");
+            return v != nullptr ? std::max(0.0, std::atof(v)) : 10.0;
+        }();
+        auto lazy_quiesce = [&](std::string& e) -> bool {
+            for (const PfPart& p : pf_parts)
+                if (!p.lent.empty()) { e = "a prompt's loan is still out"; return false; }
+            if (!ver.wait_commit(e)) return false;
+            adapt_quiesce();
+            if (cudaDeviceSynchronize() != cudaSuccess) {
+                e = cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            return true;
+        };
+        auto lazy_activate = [&](std::string& e) -> bool {
+            if (!lazy_quiesce(e)) return false;
+            const auto t0 = Clock::now();
+            const int64_t before = xcache.slots();
+            xcache.hold_live_slots(batch_lazy_keep);
+            cache_evict_past_live();
+            for (auto& u : bslot_ss[0]) {   // experts lay here: everything the slots read starts over
+                strata::core::session_restore_tables(*u);
+                strata::core::session_zero(*u, g, nullptr, nullptr);
+            }
+            if (cudaDeviceSynchronize() != cudaSuccess) {
+                e = cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            relend();
+            lazy_active = true;
+            lazy_last_busy = Clock::now();
+            std::fprintf(stderr, "strata batch: slots on: the expert cache %lld -> %lld slots, prompt chunk %lld, in %.1f ms\n",
+                         (long long) before, (long long) xcache.slots(), (long long) o.prefill_chunk,
+                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+            return true;
+        };
+        auto lazy_release = [&](std::string& e) -> bool {
+            if (!lazy_quiesce(e)) return false;
+            const auto t0 = Clock::now();
+            const int64_t before = xcache.slots();
+            int64_t dropped = 0;
+            for (BSlot& sl : bs) {   // what the slots hold is overwritten now
+                if (sl.cached) dropped += (int64_t) sl.ids.size();
+                sl = BSlot{};
+            }
+            xcache.release_live_slots();
+            if (!cache_refill_evicted(e)) return false;
+            relend();
+            lazy_active = false;
+            std::fprintf(stderr, "strata batch: slots off: the expert cache %lld -> %lld slots, prompt chunk %lld, in %.1f ms "
+                                 "(%lld tokens the slots held dropped)\n", (long long) before, (long long) xcache.slots(),
+                         (long long) o.prefill_chunk, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                         (long long) dropped);
+            return true;
+        };
         auto try_next_line = [&](std::string& out) -> bool {
             std::lock_guard<std::mutex> lk(in_mu);
             if (in_lines.empty()) return false;
@@ -13493,6 +13622,7 @@ int main(int argc, char** argv) {
         };
         for (;;) {
             line_drain_ms = 0.0;
+            if (lazy_active && batch_on()) lazy_last_busy = Clock::now();
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
                     if (!(piped ? pump(true) : batch_step())) return 1;
@@ -13573,6 +13703,15 @@ int main(int argc, char** argv) {
                     std::printf("ERR BGEN: no such free slot (--batch %d) or a bad max_new\n", o.batch);
                     std::fflush(stdout);
                     continue;
+                }
+                // STRATA_BATCH_LAZY: (max_new 1 never continues in the slot: its session is not touched, see BADM)
+                if (batch_lazy && !lazy_active && mn > 1) {
+                    std::string lerr;
+                    if (!lazy_activate(lerr)) {
+                        std::printf("ERR BGEN: the slots could not be set up: %s\n", lerr.c_str());
+                        std::fflush(stdout);
+                        continue;
+                    }
                 }
                 admit_slot = (int) b;
                 admit_max_new = mn;
@@ -14517,6 +14656,20 @@ int main(int argc, char** argv) {
                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                 }
             }
+            // STRATA_BATCH_LAZY: no slot in use for the grace time: the tail goes back to the experts, after the slot this
+            // request continues from (if any) gave its conversation back above and before this request reads its prompt
+            if (lazy_active && (admit_slot < 0 || admit_max_new <= 1) && !batch_on() &&
+                std::none_of(bs.begin(), bs.end(), [](const BSlot& sl) { return sl.partial; }) &&
+                std::chrono::duration<double>(Clock::now() - lazy_last_busy).count() >= lazy_grace_s) {
+                std::string lerr;
+                if (!lazy_release(lerr)) {
+                    if (lazy_active && xcache.slots() != batch_lazy_keep) {   // part way through: the cache cannot go on like this
+                        std::printf("ERR the expert cache could not be refilled: %s\n", lerr.c_str());
+                        return 1;
+                    }
+                    std::fprintf(stderr, "strata batch: slots stay on: %s\n", lerr.c_str());
+                }
+            }
             // the elastic K/V: a parked conversation is restored whole, and it may be longer than this prompt
             // (STRATA_PARK_VRAM_MIB: the parked K/V copies in VRAM go first, then one more try)
             if (incoming && !kvg_ensure((int64_t) incoming->live.ids.size() + 256, kv_quiesce) &&
@@ -15332,7 +15485,8 @@ int main(int argc, char** argv) {
                 // where the rest is read the same way after it (more than a chunk and more than a short read left),
                 // text only, and into a slot that is not decoding.
                 auto give_way = [&](int ys, int64_t q, std::string& err) -> bool {
-                    const bool can = ys < (int) bs.size() && !bs[(size_t) ys].active &&
+                    // (STRATA_BATCH_LAZY: while the slots are off their sessions' memory holds experts and this read's loan)
+                    const bool can = ys < (int) bs.size() && !bs[(size_t) ys].active && (!batch_lazy || lazy_active) &&
                                      (admit_slot < 0 || ys == admit_slot) && req_imgs.empty() && o.prompt_cache > 0 &&
                                      b0 - q > std::max<int64_t>(C_read, o.short_read);
                     std::string ye;

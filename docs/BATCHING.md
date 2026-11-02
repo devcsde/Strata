@@ -156,6 +156,18 @@ card, 4 from 32 GB or on a split such as 2 x 16 GB; IQ3_S needs 32 GB or a split
 card alone) it stays at one at a time and setup says: "parallel N reduces waiting for several users but costs
 about 10-25% speed per request on this card". `--parallel N` is honoured as asked either way.
 
+### Slots on demand (`STRATA_BATCH_LAZY=1`, experimental)
+
+Opt-in, in the engine's environment, one NVIDIA GPU only. The slots' sessions then take no VRAM of their own: they are
+carved in the tail of the expert cache, which holds experts until a request needs a slot. So a request alone has the
+cache a server without `--batch` has. When a slot is needed, the experts in the tail become CPU misses and the slots
+take that memory. A later request gives it back once no slot was in use for `STRATA_BATCH_LAZY_GRACE_S` seconds (default
+10): the experts are copied back from RAM. What the slots held is dropped then, so that conversation's next turn reads its
+prompt again. A long prompt being read while the slots are off does not give way to a shorter one.
+
+It is off with `--batch-mtp`, a layer split, `--peer-device`, `--vram-elastic`, `--expert-cache-per-layer` and the resident
+low-RAM mode. The engine says so in its log. Not measured yet.
+
 ## How the server uses the slots
 
 - **One request alone** runs on the usual solo path (verify windows with MTP drafts): the fastest single stream.

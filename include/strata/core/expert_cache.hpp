@@ -150,6 +150,11 @@ public:
     int64_t slots_within(int64_t bytes) const;
     /// The bytes the first `n` slots span.
     int64_t bytes_of(int64_t n) const { return slot_end(n < 0 ? 0 : n > slots_ ? slots_ : n); }
+    /// STRATA_BATCH_LAZY: `slots()` becomes the first `n` slots while the VRAM stays mapped, because the tail holds the
+    /// batch slots' sessions then.  As after `shrink`, the CALLER evicts the experts past `slots()` first.
+    void hold_live_slots(int64_t n) { live_slots_ = n < 0 ? 0 : n > slots_ ? slots_ : n; }
+    /// STRATA_BATCH_LAZY: every slot is usable again.  The slots past the old `slots()` are empty until the caller fills them.
+    void release_live_slots() { live_slots_ = slots_; }
 
     /// `(layer, expert)` -> slot index, or `kNotResident`.  Bounds-checked: a bad layer or expert returns
     /// `kNotResident` rather than reading whatever is adjacent in the table.
