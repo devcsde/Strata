@@ -14657,10 +14657,18 @@ int main(int argc, char** argv) {
                 }
             }
             // STRATA_BATCH_LAZY: no slot in use for the grace time: the tail goes back to the experts, after the slot this
-            // request continues from (if any) gave its conversation back above and before this request reads its prompt
+            // request continues from (if any) gave its conversation back above and before this request reads its prompt.
+            // A request alone that continues from a slot does not wait for the grace time: it may be a long answer the
+            // others left alone, and it could not change the cache again before it ends
+            // (STRATA_BATCH_LAZY_HANDBACK=0: it waits like any other request).
+            static const bool lazy_handback = [] {
+                const char* v = std::getenv("STRATA_BATCH_LAZY_HANDBACK");
+                return v == nullptr || v[0] != '0';
+            }();
             if (lazy_active && (admit_slot < 0 || admit_max_new <= 1) && !batch_on() &&
                 std::none_of(bs.begin(), bs.end(), [](const BSlot& sl) { return sl.partial; }) &&
-                std::chrono::duration<double>(Clock::now() - lazy_last_busy).count() >= lazy_grace_s) {
+                ((lazy_handback && admit_slot < 0 && slot_source >= 0 && from_live) ||
+                 std::chrono::duration<double>(Clock::now() - lazy_last_busy).count() >= lazy_grace_s)) {
                 std::string lerr;
                 if (!lazy_release(lerr)) {
                     if (lazy_active && xcache.slots() != batch_lazy_keep) {   // part way through: the cache cannot go on like this

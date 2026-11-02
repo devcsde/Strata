@@ -162,8 +162,9 @@ Opt-in, in the engine's environment, one NVIDIA GPU only. The slots' sessions th
 carved in the tail of the expert cache, which holds experts until a request needs a slot. So a request alone has the
 cache a server without `--batch` has. When a slot is needed, the experts in the tail become CPU misses and the slots
 take that memory. A later request gives it back once no slot was in use for `STRATA_BATCH_LAZY_GRACE_S` seconds (default
-10): the experts are copied back from RAM. What the slots held is dropped then, so that conversation's next turn reads its
-prompt again. A long prompt being read while the slots are off does not give way to a shorter one.
+10): the experts are copied back from RAM. A request alone that continues from a slot gives it back at once, without
+waiting (`STRATA_BATCH_LAZY_HANDBACK=0` makes it wait). What the slots held is dropped then, so that conversation's next
+turn reads its prompt again. A long prompt being read while the slots are off does not give way to a shorter one.
 
 It is off with `--batch-mtp`, a layer split, `--peer-device`, `--vram-elastic`, `--expert-cache-per-layer` and the resident
 low-RAM mode. The engine says so in its log. Not measured yet.
