@@ -9088,7 +9088,7 @@ int main(int argc, char** argv) {
         aa.arena = srcp == &arena_src;
         aa.multi_gpu = multi_gpu;
         aa.pipeline_windows = o.pipeline_windows >= 2;
-        aa.batch = o.batch > 0;
+        aa.batch = o.batch > 0 && !batch_lazy;   // (STRATA_BATCH_LAZY: the tier chooses on the solo path, as without slots)
         aa.peer = peer.valid();
         aa.remote_opt = remote_opt != nullptr;
         aa.adapt_overlap = adapt_overlap();
@@ -11192,6 +11192,8 @@ int main(int argc, char** argv) {
         // KL ~0.003-0.006; docs/DETAILS.md).  =0 restores 0.1.41's bytes.  Nothing to do, so no default and no line, when every
         // expert is in VRAM; off with --batch slots (a window then mixes requests, and one request's skip would depend on
         // another's tokens) and, as in the dispatch, with a peer or helper GPU.  A layer split is fine: each stage skips by itself.
+        // STRATA_BATCH_LAZY: on while the slots are off, when no window mixes requests (lazy_activate turns it off for the slots).
+        bool lazy_tail_default = false;
         {
             const char* tse = std::getenv("STRATA_ROUTE_TAIL_SKIP");
             // #1884: with nearly every expert in the GPU cache (V100 32 GB, Coder IQ1_M: 94.8% of the experts, 99.9% decode hits) the few
@@ -11217,8 +11219,8 @@ int main(int argc, char** argv) {
                 for (const auto& f : strata::kernels::cpu::expert_layout().fmt)
                     nvfp4_experts = nvfp4_experts || f.gu_type == strata::kernels::cpu::kNvfp4Type ||
                                     f.d_type == strata::kernels::cpu::kNvfp4Type;
-            const bool tail_default_path = tse == nullptr && !all_experts_resident && !nearly_all_cached && o.batch == 0 &&
-                                           decode_defaults_arch_ok() &&
+            const bool tail_default_path = tse == nullptr && !all_experts_resident && !nearly_all_cached &&
+                                           (o.batch == 0 || batch_lazy) && decode_defaults_arch_ok() &&
                                            o.peer_device < 0;
             const bool tail_default_ok = tail_default_path && !nvfp4_experts;
             if (tail_default_path && nvfp4_experts)
@@ -11229,6 +11231,7 @@ int main(int argc, char** argv) {
                                      "few are missed and skipping them costs more draft acceptance than it saves; "
                                      "STRATA_ROUTE_TAIL_SKIP=7 turns it on\n", 100.0 * (double) cached_experts / (double) host_res.size());
             if (tail_default_ok) strata::core::set_tail_skip_rank(7);
+            lazy_tail_default = tail_default_ok && batch_lazy;
             if (strata::core::tail_skip_rank() > 0 && !all_experts_resident)
                 std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP=%d is ON%s: a missed expert that every token of a verify window routes at rank %d or "
                                      "lower is skipped (+10..20%% decode on 12-16 GB cards that miss experts, answers differ slightly from 0.1.41); "
@@ -11238,7 +11241,8 @@ int main(int argc, char** argv) {
         if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         PcieAuto pcie_auto;
-        if (o.pcie_frac_auto && !all_experts_resident && o.batch == 0 && o.peer_device < 0 && (n_stages == 1 || pcie_auto_split_ok())) {
+        // (STRATA_BATCH_LAZY: refined on the solo path, the only one that steps it)
+        if (o.pcie_frac_auto && !all_experts_resident && (o.batch == 0 || batch_lazy) && o.peer_device < 0 && (n_stages == 1 || pcie_auto_split_ok())) {
             const auto& pl = strata::kernels::cpu::expert_layout();
             double sum = 0.0;
             for (int64_t l = 0; l < g.n_layers; ++l) sum += (double) pl.blob_bytes(l);
@@ -12668,6 +12672,7 @@ int main(int argc, char** argv) {
             const int64_t before = xcache.slots();
             xcache.hold_live_slots(batch_lazy_keep);
             cache_evict_past_live();
+            if (lazy_tail_default) strata::core::set_tail_skip_rank(0);   // a window mixes requests now
             for (auto& u : bslot_ss[0]) {   // experts lay here: everything the slots read starts over
                 strata::core::session_restore_tables(*u);
                 strata::core::session_zero(*u, g, nullptr, nullptr);
@@ -12696,6 +12701,7 @@ int main(int argc, char** argv) {
             xcache.release_live_slots();
             if (!cache_refill_evicted(e)) return false;
             relend();
+            if (lazy_tail_default) strata::core::set_tail_skip_rank(7);
             lazy_active = false;
             std::fprintf(stderr, "strata batch: slots off: the expert cache %lld -> %lld slots, prompt chunk %lld, in %.1f ms "
                                  "(%lld tokens the slots held dropped)\n", (long long) before, (long long) xcache.slots(),

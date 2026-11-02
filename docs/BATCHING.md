@@ -166,8 +166,12 @@ take that memory. A later request gives it back once no slot was in use for `STR
 waiting (`STRATA_BATCH_LAZY_HANDBACK=0` makes it wait). What the slots held is dropped then, so that conversation's next
 turn reads its prompt again. A long prompt being read while the slots are off does not give way to a shorter one.
 
+While the slots are off, a request also gets what `--batch` otherwise turns off for the whole session: the route tail skip,
+the measured PCIe share and the adaptive tier's choice of its asynchronous mode. The CPU's share of short prompt chunks stays
+off.
+
 It is off with `--batch-mtp`, a layer split, `--peer-device`, `--vram-elastic`, `--expert-cache-per-layer` and the resident
-low-RAM mode. The engine says so in its log. Not measured yet.
+low-RAM mode. The engine says so in its log.
 
 ## How the server uses the slots
 
