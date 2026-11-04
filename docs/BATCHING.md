@@ -170,8 +170,12 @@ While the slots are off, a request also gets what `--batch` otherwise turns off 
 the measured PCIe share and the adaptive tier's choice of its asynchronous mode. The CPU's share of short prompt chunks stays
 off.
 
-It is off with `--batch-mtp`, a layer split, `--peer-device`, `--vram-elastic`, `--expert-cache-per-layer` and the resident
-low-RAM mode. The engine says so in its log.
+It is off with a layer split, `--peer-device`, `--vram-elastic`, `--expert-cache-per-layer` and the resident low-RAM mode.
+The engine says so in its log.
+
+With `--batch-mtp` the slot drafters' K/V stays outside the tail, in VRAM of its own taken before the cache is sized. So
+giving the tail back first parks what an idle slot holds with the conversation cache, and that conversation's next turn
+goes on from there. What cannot be parked (the cache off or full, a picture) is dropped as without `--batch-mtp`.
 
 ## How the server uses the slots
 

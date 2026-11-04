@@ -6162,8 +6162,7 @@ int main(int argc, char** argv) {
     bool batch_lazy = false;
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_GPU_METAL)
     if (const char* lz = std::getenv("STRATA_BATCH_LAZY"); lz != nullptr && lz[0] != '\0' && lz[0] != '0' && o.batch > 0) {
-        const char* why = batch_mtp ? "--batch-mtp"
-                        : multi_gpu || !stages.empty() ? "a layer split"
+        const char* why = multi_gpu || !stages.empty() ? "a layer split"
                         : o.peer_device >= 0 ? "--peer-device"
                         : o.vram_elastic ? "--vram-elastic"
                         : o.expert_cache_per_layer ? "--expert-cache-per-layer"
@@ -6370,13 +6369,15 @@ int main(int argc, char** argv) {
                 // STRATA_PIPED_MTP: the slot's proposal is drafted as an asynchronous chain (chain_launch), so the
                 // pipeline goes on while it runs: the chain graphs carry the forcing kernel (a no-op here)
                 if (piped_mtp) d->set_force_capture(true);
-                if (!d->load(o.mtp, draft_geometry, *bslot_ss.back()[(size_t) b], o.spec, err, o.mtp_window, &mtp)) {
+                // STRATA_BATCH_LAZY: the slot sessions are carved later, in the cache's tail.  They take the main session's
+                // context length and RoPE table (the carve below), so the drafter can borrow them from it.
+                if (!d->load(o.mtp, draft_geometry, batch_lazy ? ss : *bslot_ss.back()[(size_t) b], o.spec, err, o.mtp_window, &mtp)) {
                     std::fprintf(stderr, "strata generate: batch MTP slot %d: %s%s\n", b, err.c_str(),
                                  vram_free_note().c_str());
                     return 1;
                 }
                 d->set_max_drafts(piped_mtp ? pm_drafts : 1);   // the serial windows verify one proposal per slot
-                d->set_ple_session(bslot_ss[0][(size_t) b].get());
+                if (!batch_lazy) d->set_ple_session(bslot_ss[0][(size_t) b].get());   // (lazy: at the carve)
                 slot_mtp.push_back(std::move(d));
             }
             if (!slot_mtp.empty()) {
@@ -7307,6 +7308,8 @@ int main(int argc, char** argv) {
                                  "cache %lld slots; --batch is off\n", o.batch, (double) need / 1073741824.0,
                          (long long) batch_lazy_keep);
             bslot_ss.clear();
+            slot_mtp.clear();
+            batch_mtp = false;
             o.batch = 0;
             batch_lazy = false;
         } else {
@@ -7318,6 +7321,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata generate: STRATA_BATCH_LAZY: slot %d's session could not be carved\n", b);
                     return 1;
                 }
+                if (batch_mtp) slot_mtp[(size_t) b]->set_ple_session(u.get());
                 bslot_ss[0].push_back(std::move(u));
             }
             cudaDeviceSynchronize();
@@ -10271,6 +10275,8 @@ int main(int argc, char** argv) {
         if (batch_lazy && src.complement_ready()) {
             std::fprintf(stderr, "strata serve: WARNING: STRATA_BATCH_LAZY: not with the resident low-RAM mode; --batch is off\n");
             bslot_ss.clear();
+            slot_mtp.clear();
+            batch_mtp = false;
             o.batch = 0;
             batch_lazy = false;
         }
@@ -12689,11 +12695,16 @@ int main(int argc, char** argv) {
                          std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
             return true;
         };
+        std::function<void(int)> lazy_park;   // park_slot, below
         auto lazy_release = [&](std::string& e) -> bool {
             if (!lazy_quiesce(e)) return false;
             const auto t0 = Clock::now();
             const int64_t before = xcache.slots();
             int64_t dropped = 0;
+            // With --batch-mtp a slot's conversation can go to the parked ones first: its draft K/V is the slot drafter's
+            // own, outside the tail.  What did not park (the cache off or full, a picture) is dropped as without it.
+            if (batch_mtp && lazy_park)
+                for (int b = 0; b < (int) bs.size(); ++b) lazy_park(b);
             for (BSlot& sl : bs) {   // what the slots hold is overwritten now
                 if (sl.cached) dropped += (int64_t) sl.ids.size();
                 sl = BSlot{};
@@ -12917,6 +12928,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking slot %d\n", b);
             }
         };
+        lazy_park = park_slot;
         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
         // so it keeps the conversation it holds
         auto batch_step = [&]() -> bool {
