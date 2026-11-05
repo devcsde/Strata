@@ -35,6 +35,7 @@
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
+#include <mma.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -647,12 +648,19 @@ __global__ void k_attn_softmax16(const float* S, __half* S16, int ld, int T, int
     const float* row = S + ((size_t) h * T + t) * ld;
     __half* out = S16 + ((size_t) h * T + t) * ld;
     const int n = min(P, pos0 + t + 1);
-    float mx = -INFINITY;
-    for (int p = threadIdx.x; p < n; p += blockDim.x) mx = fmaxf(mx, row[p] * scale);
-    mx = block_max(mx, sh);
-    float sum = 0.f;
-    for (int p = threadIdx.x; p < n; p += blockDim.x) sum += expf(row[p] * scale - mx);
-    sum = block_sum(sum, sh);
+    // max and sum in one read (each thread's sum rescaled when its max moves), then the write
+    float m_t = -INFINITY, l_t = 0.f;
+    for (int p = threadIdx.x; p < n; p += blockDim.x) {
+        const float v = row[p] * scale;
+        if (v > m_t) {
+            l_t = l_t * expf(m_t - v) + 1.f;
+            m_t = v;
+        } else {
+            l_t += expf(v - m_t);
+        }
+    }
+    const float mx = block_max(m_t, sh);
+    const float sum = block_sum(m_t == -INFINITY ? 0.f : l_t * expf(m_t - mx), sh);
     const float inv = 1.0f / sum;
     for (int p = threadIdx.x; p < P; p += blockDim.x) out[p] = __float2half(p < n ? expf(row[p] * scale - mx) * inv : 0.f);
 }
@@ -660,6 +668,171 @@ __global__ void k_attn_softmax16(const float* S, __half* S16, int ld, int T, int
 __global__ void k_gate_mul(float* att, const float* gate, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) att[i] *= sigm(gate[i]);
+}
+
+// ---- the prompt attention, flash style (HD 256): no score matrix in memory; K / V tiles straight from the cache
+namespace fa {
+namespace wmma = nvcuda::wmma;
+constexpr int BM = 64, BN = 64, HD = 256, LD = HD + 8, SLD = BN + 4, PLD = BN + 8;
+constexpr size_t kSmem = (size_t) BM * LD * 2 + (size_t) BN * LD * 2 + (size_t) BM * SLD * 4 + (size_t) BM * PLD * 2 +
+                         (size_t) 3 * BM * 4;
+/// 64 cells [c0, c0 + 64) of one KV head into dst [cell][LD] halves (cells at or past ncell: zeros).  256 threads.
+template <bool Q8>
+__device__ __forceinline__ void load_tile(const float* base, __half* dst, int kvh, int ctx, int krs, int c0, int ncell) {
+    const int grp = threadIdx.x & 63, sub = threadIdx.x >> 6;   // 4 dims per thread, 4 cells per pass
+    constexpr int NP = BN / 4;
+    // every read issued first (one wait for all of them), then converted and stored
+    float4 v[NP];
+    float s[NP];
+#pragma unroll
+    for (int i = 0; i < NP; ++i) {
+        const int c = c0 + sub + 4 * i;
+        v[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+        s[i] = 0.f;
+        if (c < ncell) {
+            const float* row = base + ((size_t) kvh * ctx + c) * krs;
+            if (Q8) {
+                const char4 cv = __ldg(reinterpret_cast<const char4*>(row) + grp);
+                s[i] = __ldg(row + HD / 4 + grp / 8);
+                v[i] = make_float4(cv.x, cv.y, cv.z, cv.w);
+            } else {
+                v[i] = __ldg(reinterpret_cast<const float4*>(row) + grp);
+                s[i] = 1.f;
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < NP; ++i) {
+        __half2* d = reinterpret_cast<__half2*>(dst + (sub + 4 * i) * LD + grp * 4);
+        d[0] = __floats2half2_rn(v[i].x * s[i], v[i].y * s[i]);
+        d[1] = __floats2half2_rn(v[i].z * s[i], v[i].w * s[i]);
+    }
+}
+}  // namespace fa
+
+/// One KV head's prompt attention for 64 query rows (64 / G tokens from t0 = blockIdx.x * 64 / G, each with its G query
+/// heads; row r = token * G + g): over the cells [0, p0 + t] of each, in tiles of 64 cells read from the cache (fp32 or
+/// int8, as fp16), S = Q K^T and O += P V on the tensor cores (fp32 accumulation), the softmax online (O rescaled when
+/// a row's max moves).  att[(t * H + kvh * G + g) * HD + d] = O / l (not gated).
+/// grid (ceil(T / (64 / G)), HKV), block 256, dynamic shared fa::kSmem; 64 % G == 0.
+template <bool Q8>
+__global__ void __launch_bounds__(256) k_attn_flash(const float* __restrict__ q, const float* __restrict__ kc,
+                                                    const float* __restrict__ vc, float* __restrict__ att, int T, int p0,
+                                                    int H, int HKV, int ctx, int krs, float scale) {
+    using namespace fa;
+    extern __shared__ __align__(128) unsigned char fa_sm[];
+    __half* Qs = reinterpret_cast<__half*>(fa_sm);
+    __half* KVs = Qs + BM * LD;
+    float* Sf = reinterpret_cast<float*>(KVs + BN * LD);
+    __half* Ph = reinterpret_cast<__half*>(Sf + BM * SLD);
+    float* rm = reinterpret_cast<float*>(Ph + BM * PLD);
+    float* rl = rm + BM;
+    float* ra = rl + BM;
+    const int G = H / HKV, TB = BM / G;
+    const int kvh = blockIdx.y, tb0 = blockIdx.x * TB;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    for (int i = tid; i < BM * HD; i += blockDim.x) {
+        const int r = i / HD, d = i % HD, t = tb0 + r / G, g = r % G;
+        Qs[r * LD + d] = __float2half(t < T ? q[((size_t) t * H + kvh * G + g) * HD + d] : 0.f);
+    }
+    if (tid < BM) {
+        rm[tid] = -1e30f;
+        rl[tid] = 0.f;
+    }
+    const int ncell = p0 + min(T, tb0 + TB);   // the cells the block's last token sees
+    const int rt = warp >> 1;                   // this warp's 16 rows (O and the scores)
+    const int ct0 = (warp & 1) * 8;             // its 8 of O's 16 column tiles
+    const int sc0 = (warp & 1) * 2;             // its 2 of the scores' 4 column tiles
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> O[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) wmma::fill_fragment(O[j], 0.f);
+    __syncthreads();
+    for (int c0 = 0; c0 < ncell; c0 += BN) {
+        load_tile<Q8>(kc, KVs, kvh, ctx, krs, c0, ncell);
+        __syncthreads();
+        {   // S = Q K^T
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> s0, s1;
+            wmma::fill_fragment(s0, 0.f);
+            wmma::fill_fragment(s1, 0.f);
+#pragma unroll 4
+            for (int k = 0; k < HD; k += 16) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b0, b1;
+                wmma::load_matrix_sync(a, Qs + rt * 16 * LD + k, LD);
+                wmma::load_matrix_sync(b0, KVs + sc0 * 16 * LD + k, LD);
+                wmma::load_matrix_sync(b1, KVs + (sc0 + 1) * 16 * LD + k, LD);
+                wmma::mma_sync(s0, a, b0, s0);
+                wmma::mma_sync(s1, a, b1, s1);
+            }
+            wmma::store_matrix_sync(Sf + rt * 16 * SLD + sc0 * 16, s0, SLD, wmma::mem_row_major);
+            wmma::store_matrix_sync(Sf + rt * 16 * SLD + (sc0 + 1) * 16, s1, SLD, wmma::mem_row_major);
+        }
+        __syncthreads();
+        for (int rr = 0; rr < BM / 8; ++rr) {   // the online softmax: a warp per 8 rows, a lane per 2 cells
+            const int r = warp * (BM / 8) + rr;
+            const int t = tb0 + r / G;
+            const int lim = t < T ? p0 + t : -1;   // the last cell row r sees
+            float v0 = Sf[r * SLD + lane], v1 = Sf[r * SLD + lane + 32];
+            v0 = c0 + lane <= lim ? v0 * scale : -INFINITY;
+            v1 = c0 + lane + 32 <= lim ? v1 * scale : -INFINITY;
+            float mx = fmaxf(v0, v1);
+            for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            const float mo = rm[r], mn = fmaxf(mo, mx);
+            const float e0 = expf(v0 - mn), e1 = expf(v1 - mn);
+            float s = e0 + e1;
+            for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+            Ph[r * PLD + lane] = __float2half(e0);
+            Ph[r * PLD + lane + 32] = __float2half(e1);
+            __syncwarp();
+            if (lane == 0) {
+                const float al = expf(mo - mn);
+                ra[r] = al;
+                rl[r] = rl[r] * al + s;
+                rm[r] = mn;
+            }
+        }
+        __syncthreads();
+        load_tile<Q8>(vc, KVs, kvh, ctx, krs, c0, ncell);
+        {   // O *= alpha per row, when a row's max moved (the scores' room as scratch: a 16 x 16 tile per warp)
+            bool need = false;
+            for (int i = 0; i < 16; ++i) need |= ra[rt * 16 + i] != 1.f;
+            if (need) {
+                float* scr = Sf + warp * 256;
+                for (int j = 0; j < 8; ++j) {
+                    wmma::store_matrix_sync(scr, O[j], 16, wmma::mem_row_major);
+                    __syncwarp();
+                    for (int i = lane; i < 256; i += 32) scr[i] *= ra[rt * 16 + i / 16];
+                    __syncwarp();
+                    wmma::load_matrix_sync(O[j], scr, 16, wmma::mem_row_major);
+                    __syncwarp();
+                }
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < BN; k += 16) {   // O += P V
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> pa;
+            wmma::load_matrix_sync(pa, Ph + rt * 16 * PLD + k, PLD);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> vb;
+                wmma::load_matrix_sync(vb, KVs + k * LD + (ct0 + j) * 16, LD);
+                wmma::mma_sync(O[j], pa, vb, O[j]);
+            }
+        }
+        __syncthreads();
+    }
+    float* scr = Sf + warp * 256;
+    for (int j = 0; j < 8; ++j) {
+        wmma::store_matrix_sync(scr, O[j], 16, wmma::mem_row_major);
+        __syncwarp();
+        for (int i = lane; i < 256; i += 32) {
+            const int r = rt * 16 + i / 16, col = (ct0 + j) * 16 + i % 16;
+            const int t = tb0 + r / G, g = r % G;
+            if (t < T) att[((size_t) t * H + kvh * G + g) * HD + col] = scr[i] / rl[r];
+        }
+        __syncwarp();
+    }
 }
 
 /// Picture rows over the embeddings of a chunk: x[r] = img[map[r]] for the rows with map[r] >= 0 (the rows of a picture's
@@ -1397,6 +1570,11 @@ struct Engine {
     int mtp_d = 0;   // MTP drafts per speculative step (0: none; greedy requests only)
     bool kv_q8 = false;   // --kv int8: the K / V cache in int8 with a scale per 32 values (see kv_at), else fp32
     bool attn_gqa = false;   // k_attn_part_gqa for the split-K attention
+    bool attn_flash = false; // k_attn_flash for the prompt chunks
+    // STRATA_Q36_PROF=1: the prompt attention's GPU time summed (each layer's synced: a little slower then)
+    bool prof_on = std::getenv("STRATA_Q36_PROF") != nullptr;
+    cudaEvent_t prof_e0 = nullptr, prof_e1 = nullptr;
+    double prof_att_ms = 0.0;
     int kv_rs = 0;        // a cache row's floats (one KV head, one cell): head_dim, or head_dim / 4 + head_dim / 32
 
     // ---- sessions: the conversation states.  One for a single-request engine; --batch N keeps N, each with its own
@@ -1737,6 +1915,31 @@ struct Engine {
                    std::getenv("STRATA_Q36_NO_GQA") == nullptr;
         std::fprintf(stderr, "strata-q36: %lld query heads, %lld KV heads: decode attention %s\n", (long long) g.n_head,
                      (long long) g.n_head_kv, attn_gqa ? "grouped (K / V read once per KV head)" : "per query head");
+        // the prompt attention flash style on the tensor cores (sm_70+), unless STRATA_Q36_NO_FLASH
+        {
+            int dev = 0, major = 0, smem_optin = 0;
+            CK(cudaGetDevice(&dev));
+            CK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev));
+            CK(cudaDeviceGetAttribute(&smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+            attn_flash = g.head_dim == fa::HD && g.n_head % g.n_head_kv == 0 && fa::BM % (g.n_head / g.n_head_kv) == 0 &&
+                         major >= 7 && (size_t) smem_optin >= fa::kSmem && std::getenv("STRATA_Q36_FLASH") != nullptr &&
+                         std::string(std::getenv("STRATA_Q36_FLASH")) != "0";
+            // (opt-in: on the A4000 it is slower than the score matrix path so far - one block per SM, phases in turn)
+            if (attn_flash) {
+                CK(cudaFuncSetAttribute(k_attn_flash<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) fa::kSmem));
+                CK(cudaFuncSetAttribute(k_attn_flash<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) fa::kSmem));
+                if (prof_on) {
+                    cudaFuncAttributes fa_at{};
+                    CK(cudaFuncGetAttributes(&fa_at, k_attn_flash<true>));
+                    int nb = 0;
+                    CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k_attn_flash<true>, 256, fa::kSmem));
+                    std::fprintf(stderr, "strata-q36: flash kernel: %d registers, %zu B local (spills), %d blocks per SM\n",
+                                 fa_at.numRegs, fa_at.localSizeBytes, nb);
+                }
+            }
+            std::fprintf(stderr, "strata-q36: prompt attention %s\n",
+                         attn_flash ? "flash (tensor cores, no score matrix)" : "score matrix + cuBLAS");
+        }
         if (kv_q8) std::fprintf(stderr, "strata-q36: K / V cache int8 (a scale per 32 values)\n");
         const size_t T = (size_t) tmax, N = (size_t) g.n_embd, Kp = (size_t) m->top_k, FF = (size_t) g.n_ff;
         const size_t C = (size_t) g.ssm_conv_channels;
@@ -2338,6 +2541,33 @@ struct Engine {
                 // a prompt chunk: scores = Q K^T and out = P V as FP16 GEMMs (FP32 accumulation, FP32 scores) per KV
                 // head (its query heads one strided batch over the shared K / V), the causal softmax in between writing
                 // FP16 probabilities; the queries in slices whose scores fit
+                if (prof_on) {
+                    if (!prof_e0) {
+                        CK(cudaEventCreate(&prof_e0));
+                        CK(cudaEventCreate(&prof_e1));
+                    }
+                    CK(cudaEventRecord(prof_e0, st));
+                }
+                if (attn_flash) {
+                    const int G = H / HKV, TB = fa::BM / G;
+                    const dim3 grid((unsigned) ((T + TB - 1) / TB), (unsigned) HKV);
+                    if (kv_q8)
+                        k_attn_flash<true><<<grid, 256, fa::kSmem, st>>>(q, kc[li], vc[li], att, T, (int) p0, H, HKV, ctx,
+                                                                         kv_rs, 1.0f / sqrtf((float) HD));
+                    else
+                        k_attn_flash<false><<<grid, 256, fa::kSmem, st>>>(q, kc[li], vc[li], att, T, (int) p0, H, HKV, ctx,
+                                                                          kv_rs, 1.0f / sqrtf((float) HD));
+                    k_gate_mul<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(att, gate, (int64_t) T * H * HD);
+                    if (prof_on) {
+                        CK(cudaEventRecord(prof_e1, st));
+                        CK(cudaEventSynchronize(prof_e1));
+                        float ms = 0.f;
+                        CK(cudaEventElapsedTime(&ms, prof_e0, prof_e1));
+                        prof_att_ms += ms;
+                    }
+                    mm(L.wo, att, y, T);
+                    goto attn_done;
+                }
                 const int P = (int) p0 + T;
                 const int ldp = (P + 7) / 8 * 8;
                 const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) (kAttScoreFloats / ((size_t) H * ldp))));
@@ -2375,6 +2605,13 @@ struct Engine {
                     }
                 }
                 k_gate_mul<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(att, gate, (int64_t) T * H * HD);
+                if (prof_on) {
+                    CK(cudaEventRecord(prof_e1, st));
+                    CK(cudaEventSynchronize(prof_e1));
+                    float ms = 0.f;
+                    CK(cudaEventElapsedTime(&ms, prof_e0, prof_e1));
+                    prof_att_ms += ms;
+                }
             } else {
                 // split-K over 256-cell chunks; the chunk grid covers every cell a row can see (graph mode: the whole
                 // context, past-the-end chunks return at once)
@@ -2411,6 +2648,7 @@ struct Engine {
                 }
             }
             mm(L.wo, att, y, T);
+        attn_done:;
         }
         add_rms_post(L, T);
         // routed experts (one token: the router and the shared expert's gate in one product, the gate its last row)
@@ -4352,12 +4590,16 @@ int strata::qwen35::run(int argc, char** argv) {
         std::vector<int32_t> toks((size_t) std::max(bench_pp, 1));
         std::mt19937 rng(1234);
         for (auto& t : toks) t = (int32_t) (rng() % 200000u);
-        for (int rep = 0; rep < 3; ++rep) {
+        const int reps = std::getenv("STRATA_Q36_BENCH_REPS") ? std::max(1, std::atoi(std::getenv("STRATA_Q36_BENCH_REPS"))) : 3;
+        for (int rep = 0; rep < reps; ++rep) {
             E.reset();
+            E.prof_att_ms = 0.0;
             const auto t0 = Clock::now();
             E.process(toks.data(), (int64_t) toks.size(), [](int64_t) {});
             CK(cudaStreamSynchronize(E.st));
             const double pp_ms = ms_since(t0);
+            if (E.prof_on)
+                std::printf("bench %d: prompt attention %.0f ms of %.0f ms\n", rep, E.prof_att_ms, pp_ms);
             const auto t1 = Clock::now();
             int nx = E.greedy();
             for (int i = 0; i < bench_tg; ++i) {
