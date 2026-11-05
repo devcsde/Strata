@@ -3102,8 +3102,11 @@ struct Engine {
     /// `cancel`: a stop asked for before the state moves keeps only x (the caller then emits no draft), so that a request
     /// stopped mid-answer leaves the state at the tokens it has shown: a conversation that continues from them (the server's
     /// hand-over of a stopped request to a batch slot) reuses it instead of reading them again.
+    /// `pick_fn` (a sampled request): row r's token is pick_fn(r) (drawn from row r's logits given the rows before it
+    /// were kept) instead of the row's argmax; a draft is kept when the drawn token equals it, so the text has the
+    /// distribution of drawing one token at a time.
     int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks,
-                  const std::atomic<bool>* cancel = nullptr) {
+                  const std::atomic<bool>* cancel = nullptr, const std::function<int(int)>* pick_fn = nullptr) {
         const int N = (int) m->g.n_embd;
         if (main_hybrid) D = std::min<int>(D, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
         const int T0 = (int) fix.size() + 1;   // the redo rows and the row of x
@@ -3152,6 +3155,12 @@ struct Engine {
         rows_deferred = false;
         CK(cudaMemcpyAsync(hpin + 2, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
+        if (pick_fn) {   // drawn row by row, up to the first that differs from its draft
+            for (int r = 0; r <= D; ++r) {
+                hpin[2 + r] = (*pick_fn)(r);
+                if (r == D || hpin[2 + r] != drafts[(size_t) r]) break;
+            }
+        }
         int a = 0;
         while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
         if (cancel != nullptr && cancel->load()) a = 0;
@@ -3560,6 +3569,14 @@ std::string build_images(const std::string& path, const std::vector<int32_t>& id
 }
 
 // ------------------------------------------------------------------------------------------------ serve
+/// MTP drafts for sampled requests too (each row's token drawn from its own logits, a draft kept when the drawn token
+/// equals it: the text keeps the distribution of drawing one token at a time).  STRATA_Q36_SAMPLED_MTP=0: greedy only.
+bool sampled_mtp_on() {
+    static const bool on = std::getenv("STRATA_Q36_SAMPLED_MTP") == nullptr ||
+                           std::string(std::getenv("STRATA_Q36_SAMPLED_MTP")) != "0";
+    return on;
+}
+
 /// A batch slot: a session decoding (its next token is `x`, not yet in the state).
 struct Slot {
     bool active = false, stop = false;
@@ -3632,7 +3649,7 @@ struct Serve {
         int nc = 0;
         for (int k = 0; k < S && nc < room; ++k) {
             const int i = (mtp_turn + k) % S;
-            if (!slots[(size_t) act[(size_t) i]].smp.needs_logits()) { cand[(size_t) i] = 1; ++nc; }
+            if (!slots[(size_t) act[(size_t) i]].smp.needs_logits() || sampled_mtp_on()) { cand[(size_t) i] = 1; ++nc; }
         }
         ++mtp_turn;
         // a candidate without a proposal gets its first one from the state its last row left
@@ -3687,7 +3704,14 @@ struct Serve {
             bool done = false;
             int y = y0;
             for (int j = 0; j < rows_kept; ++j) {
-                if (j == 1) y = E.rows_pick[r0 + 1];
+                if (j == 1) {   // the proposal was kept: the next token from its row (drawn given it, for a sampled slot)
+                    if (sl.smp.needs_logits()) {
+                        E.host_logits_row(r0 + 1, lg);
+                        y = sample(lg, sl.smp, sl.hist, sl.rng);
+                    } else {
+                        y = E.rows_pick[r0 + 1];
+                    }
+                }
                 ss.live.push_back(fed[j]);
                 std::printf("BT %d %d\n", b, y);
                 ++sl.produced;
@@ -3757,7 +3781,7 @@ struct Serve {
         if (E.bmtp && E.mtp_d > 0) {   // proposals need a row to spare and a slot that decodes greedily
             int act = 0, greedy = 0;
             for (const Slot& sl : slots)
-                if (sl.active) { ++act; greedy += !sl.smp.needs_logits(); }
+                if (sl.active) { ++act; greedy += !sl.smp.needs_logits() || sampled_mtp_on(); }
             if (greedy > 0 && Engine::kVerify - act > 0) { window_mtp(); return; }
         }
         window_plain();
@@ -3998,9 +4022,19 @@ struct Serve {
         const char* finish = "length";
         // greedy requests alone with the MTP block: speculative steps of mtp_d drafts (verified, so the text is the greedy
         // text); sampled ones, and requests beside others, one token at a time
-        const bool spec = E.mtp_d > 0 && !smp.needs_logits() && !adm;
+        // sampled requests too (STRATA_Q36_SAMPLED_MTP=0: greedy only): each row's token drawn from its own logits, a
+        // draft kept when the drawn token equals it
+        const bool spec = E.mtp_d > 0 && (!smp.needs_logits() || sampled_mtp_on()) && !adm;
         std::vector<int32_t> fix, drafts;
         int32_t picks[16];
+        bool nx_drawn = false;   // nx came from a speculative step's draw (not from the logits buffer)
+        const std::function<int(int)> draw = [&](int r) {
+            E.host_logits_row(r, lg);
+            for (int i = 0; i < r; ++i) hist.push_back(drafts[(size_t) i]);   // the rows before r were kept
+            const int y = sample(lg, smp, hist, rng);
+            hist.resize(hist.size() - (size_t) r);
+            return y;
+        };
         int nx = smp.needs_logits() ? -1 : E.greedy();
         if (adm) {
             if (smp.needs_logits()) {
@@ -4037,10 +4071,11 @@ struct Serve {
             return;
         }
         for (;;) {
-            if (smp.needs_logits()) {
+            if (smp.needs_logits() && !nx_drawn) {
                 E.host_logits(lg);
                 nx = sample(lg, smp, hist, rng);
             }
+            nx_drawn = false;
             auto emit = [&](int t) {   // false: the answer ends here
                 std::printf("T %d\n", t);
                 std::fflush(stdout);
@@ -4054,7 +4089,7 @@ struct Serve {
             if (!emit(nx)) break;
             if (n_active > 0) window();
             if (spec && n_active == 0 && E.pos + E.mtp_d + 1 <= E.ctx) {
-                const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks, &stop);
+                const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks, &stop, smp.needs_logits() ? &draw : nullptr);
                 offered += E.mtp_d;
                 accepted += a;
                 // the state now holds x and every accepted draft, whether or not the answer ends inside them (an end of
@@ -4069,6 +4104,7 @@ struct Serve {
                     if (!emit(drafts[(size_t) i])) ended = true;
                 if (ended) break;
                 nx = picks[a];
+                nx_drawn = true;
                 continue;
             }
             if (E.pos + 1 > E.ctx) break;
