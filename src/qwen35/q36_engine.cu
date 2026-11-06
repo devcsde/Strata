@@ -1872,6 +1872,144 @@ struct Engine {
                     (long long) (bytes / 1048576.0));
         std::fflush(stdout);
     }
+    // ---- prefix snapshots (STRATA_Q36_SNAPS=N, 0 = off): the recurrent state (conv + S of every GDN layer) and hlast at
+    // points of a prompt read, kept in pinned host memory.  The KV rows of a prefix stay in whichever session holds those
+    // tokens; with a snapshot of the same prefix another session (or the same one, stepped back) continues from there:
+    // the rows copied on the GPU, the state from the host - instead of reading the prefix again (the recurrent state
+    // itself cannot step back).  Text only (no pictures in the prefix).
+    struct Snap {
+        std::vector<int32_t> ids;    // the prefix
+        float* host = nullptr;       // [GDN layers]{conv, S} then hlast
+        uint64_t used = 0;
+    };
+    std::vector<Snap> snaps;
+    int snap_max = 0;
+    int64_t snap_every = 4096, snap_far = 32768, snap_every_far = 16384;
+    size_t snap_floats = 0;
+    uint64_t snap_clock = 0;
+    long long snap_taken = 0, snap_hits = 0;
+    void snap_init() {
+        if (const char* v = std::getenv("STRATA_Q36_SNAPS")) snap_max = std::max(0, std::atoi(v));
+        if (const char* v = std::getenv("STRATA_Q36_SNAP_EVERY")) snap_every = std::max(1024, std::atoi(v));
+        if (snap_max <= 0) return;
+        const auto& g = m->g;
+        const size_t C = (size_t) g.ssm_conv_channels;
+        size_t f = 0;
+        for (const Layer& L : m->layers)
+            if (!L.attn) f += C * (g.ssm_d_conv - 1) + (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size;
+        snap_floats = f + (size_t) g.n_embd;
+        std::fprintf(stderr, "strata-q36: prefix snapshots: up to %d of %.1f MiB in host memory (every %lld tokens to %lld, then "
+                     "every %lld, and at a prompt's end)\n", snap_max, (double) snap_floats * 4 / (1 << 20),
+                     (long long) snap_every, (long long) snap_far, (long long) snap_every_far);
+    }
+    /// The next point (a token count) after `at` where a read keeps a snapshot.
+    int64_t snap_next(int64_t at) const {
+        if (at < snap_far) return (at / snap_every + 1) * snap_every;
+        return (at / snap_every_far + 1) * snap_every_far;
+    }
+    /// Keep session si's recurrent state as the snapshot of ids[0, n) (its state must be at n now).
+    void snap_take(int si, const int32_t* ids, int64_t n) {
+        if (snap_max <= 0 || n <= 0) return;
+        for (Snap& sp : snaps)   // the same prefix already kept
+            if ((int64_t) sp.ids.size() == n && std::equal(sp.ids.begin(), sp.ids.end(), ids)) { sp.used = ++snap_clock; return; }
+        Snap* dst = nullptr;
+        if ((int) snaps.size() < snap_max) {
+            Snap sp;
+            if (cudaHostAlloc((void**) &sp.host, snap_floats * 4, cudaHostAllocDefault) != cudaSuccess) {
+                (void) cudaGetLastError();
+                std::fprintf(stderr, "strata-q36: prefix snapshots: no more pinned host memory (%zu kept)\n", snaps.size());
+                snap_max = (int) snaps.size();
+                if (snaps.empty()) return;
+            } else {
+                snaps.push_back(std::move(sp));
+                dst = &snaps.back();
+            }
+        }
+        if (!dst) {
+            dst = &snaps[0];
+            for (Snap& sp : snaps) if (sp.used < dst->used) dst = &sp;
+        }
+        const auto& g = m->g;
+        const Sess& ss = sess[(size_t) si];
+        const size_t C = (size_t) g.ssm_conv_channels, nc = C * (g.ssm_d_conv - 1),
+                     nS = (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size;
+        float* h = dst->host;
+        for (size_t l = 0; l < ss.conv.size(); ++l) {
+            if (!ss.conv[l]) continue;
+            CK(cudaMemcpyAsync(h, ss.conv[l], nc * 4, cudaMemcpyDeviceToHost, st));
+            h += nc;
+            CK(cudaMemcpyAsync(h, ss.S[l], nS * 4, cudaMemcpyDeviceToHost, st));
+            h += nS;
+        }
+        CK(cudaMemcpyAsync(h, ss.hlast, (size_t) g.n_embd * 4, cudaMemcpyDeviceToHost, st));
+        dst->ids.assign(ids, ids + n);
+        dst->used = ++snap_clock;
+        ++snap_taken;
+    }
+    /// The longest kept prefix of `ids` (shorter than ids, longer than `beyond`) whose KV rows an allocated session still
+    /// holds: -> its index (or -1) and that session (`holder`, `self` preferred).
+    int snap_find(const std::vector<int32_t>& ids, size_t beyond, int self, int& holder) const {
+        int best = -1;
+        holder = -1;
+        for (size_t i = 0; i < snaps.size(); ++i) {
+            const Snap& sp = snaps[i];
+            const size_t n = sp.ids.size();
+            if (n <= beyond || n >= ids.size() || (best >= 0 && n <= snaps[(size_t) best].ids.size())) continue;
+            if (!std::equal(sp.ids.begin(), sp.ids.end(), ids.begin())) continue;
+            int h = -1;
+            for (int k = 0; k < n_sess; ++k) {
+                const Sess& ss = sess[(size_t) k];
+                if (ss.conv.empty() || ss.live.size() < n || !std::equal(sp.ids.begin(), sp.ids.end(), ss.live.begin())) continue;
+                bool pic = false;
+                for (const ImgKey& q : ss.imgs) pic |= q.cell < (int64_t) n;
+                if (pic) continue;
+                if (h < 0 || k == self) h = k;
+            }
+            if (h < 0) continue;
+            best = (int) i;
+            holder = h;
+        }
+        return best;
+    }
+    /// Session dst continues from snapshot si: the KV rows of its prefix from session `holder` (unless dst holds them),
+    /// the recurrent state and hlast from the host; dst then holds exactly that prefix.
+    void snap_restore(int dst, int si, int holder) {
+        Snap& sp = snaps[(size_t) si];
+        const int64_t n = (int64_t) sp.ids.size();
+        sess[(size_t) cur].pos = pos;
+        const auto& g = m->g;
+        Sess& b = sess[(size_t) dst];
+        if (holder != dst) {
+            const Sess& a = sess[(size_t) holder];
+            const size_t row = (size_t) ctx * kv_rs * 4;
+            for (size_t l = 0; l < a.kc.size(); ++l) {
+                if (!a.kc[l]) continue;
+                CK(cudaMemcpy2DAsync(b.kc[l], row, a.kc[l], row, (size_t) n * kv_rs * 4, (size_t) g.n_head_kv,
+                                     cudaMemcpyDeviceToDevice, st));
+                CK(cudaMemcpy2DAsync(b.vc[l], row, a.vc[l], row, (size_t) n * kv_rs * 4, (size_t) g.n_head_kv,
+                                     cudaMemcpyDeviceToDevice, st));
+            }
+        }
+        const size_t C = (size_t) g.ssm_conv_channels, nc = C * (g.ssm_d_conv - 1),
+                     nS = (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size;
+        const float* h = sp.host;
+        for (size_t l = 0; l < b.conv.size(); ++l) {
+            if (!b.conv[l]) continue;
+            CK(cudaMemcpyAsync(b.conv[l], h, nc * 4, cudaMemcpyHostToDevice, st));
+            h += nc;
+            CK(cudaMemcpyAsync(b.S[l], h, nS * 4, cudaMemcpyHostToDevice, st));
+            h += nS;
+        }
+        CK(cudaMemcpyAsync(b.hlast, h, (size_t) g.n_embd * 4, cudaMemcpyHostToDevice, st));
+        CK(cudaStreamSynchronize(st));
+        b.pos = n;
+        b.rdelta = 0;
+        b.live = sp.ids;
+        b.imgs.clear();
+        sp.used = ++snap_clock;
+        ++snap_hits;
+        if (dst == cur) load_cur();
+    }
     int n_allocated() const {
         int n = 0;
         for (const Sess& ss : sess) n += ss.conv.empty() ? 0 : 1;
@@ -4256,11 +4394,24 @@ struct Serve {
             }
         }
         E.select(s);
-        if (reuse == 0) {
+        // ---- a kept prefix snapshot longer than what the session holds (a conversation another slot holds too, a new one
+        // with a known system prompt, or this one stepped back): continue from it.  Looked up before a reset, so the
+        // session's own rows still count.
+        const bool snap_ok = E.snap_max > 0 && ir.imgs.empty();
+        int snap_i = -1, snap_holder = -1;
+        if (snap_ok) snap_i = E.snap_find(ids, reuse + 512, s, snap_holder);
+        if (snap_i >= 0) {
+            const auto r0 = Clock::now();
+            E.snap_restore(s, snap_i, snap_holder);
+            reuse = E.snaps[(size_t) snap_i].ids.size();
+            std::fprintf(stderr, "strata-q36: prefix: session %d continues from a snapshot of %zu tokens (rows from session "
+                         "%d) in %.0f ms\n", s, reuse, snap_holder, ms_since(r0));
+        } else if (reuse == 0) {
             E.reset();
             ss.live.clear();
             ss.imgs.clear();
         }
+        int64_t snap_at = E.snap_next((int64_t) reuse);
         if (geni) E.set_images(ir.rows, ir.cell_row, ir.mrope, (int64_t) ids.size(), ir.delta);
         else E.clear_images();
         const auto t0 = Clock::now();
@@ -4270,6 +4421,10 @@ struct Serve {
             std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) fresh, ms_since(t0),
                         (double) done / std::max(1e-9, ms_since(t0) / 1000.0));
             std::fflush(stdout);
+            if (snap_ok && done < fresh && (int64_t) reuse + done >= snap_at) {   // (the state is at reuse + done here)
+                E.snap_take(s, ids.data(), (int64_t) reuse + done);
+                snap_at = E.snap_next((int64_t) reuse + done);
+            }
             if (n_active > 0 && done < fresh) {
                 poll_control();
                 // the slots decoding go on between a read's chunks (the last chunk's
@@ -4292,6 +4447,9 @@ struct Serve {
             ss.imgs.clear();
         }
         E.sess[(size_t) E.cur].pos = E.pos;
+        // the prompt's end, when this read was long (another request with this prompt, or this conversation stepped back
+        // to it after an answer the client does not send back, starts here)
+        if (snap_ok && !cancelled && got == fresh && fresh >= 2048) E.snap_take(s, ids.data(), (int64_t) ids.size());
         const double prompt_ms = ms_since(t0);
         if (cancelled) {
             std::printf("DONE 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0 0 0 0.0 %lld 0\n", ids.size(), prompt_ms, reuse, (long long) got);
@@ -4610,6 +4768,7 @@ int strata::qwen35::run(int argc, char** argv) {
         std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
         return 1;
     }
+    E.snap_init();
     struct Report {
         Engine& E;
         ~Report() {
