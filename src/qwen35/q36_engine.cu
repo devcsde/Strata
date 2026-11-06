@@ -1709,6 +1709,10 @@ struct Engine {
     double lazy_grace_s = 30.0;
     Clock::time_point last_admit{};
     long long lazy_grows = 0, lazy_shrinks = 0;
+    // STRATA_Q36_LAZY_FIT=1: each resize takes the slots the free VRAM holds (less lazy_reserve, STRATA_Q36_LAZY_RESERVE_MIB)
+    // instead of the estimate's S_grown - the estimate leaves ~1-2 GiB unused with every session allocated
+    bool lazy_fit = false;
+    size_t lazy_reserve = (size_t) 768 << 20;
 
     void free_session(Sess& ss) const {
         for (auto* v : {&ss.conv, &ss.S, &ss.kc, &ss.vc}) {
@@ -1745,7 +1749,8 @@ struct Engine {
     }
     /// Every hybrid layer's slot buffer freed, `between` run, then allocated again with S slots holding the S experts the
     /// routing used most (the residents first among equals), copied from the host blobs.
-    template <class F> void resize_slots(int S, F between) {
+    /// -> the slots per layer it allocated (S, or with lazy_fit what fits).
+    template <class F> int resize_slots(int S, F between) {
         CK(cudaDeviceSynchronize());
         const int64_t ne = m->g.n_expert;
         for (size_t li = 0; li < hy.size(); ++li) {
@@ -1756,6 +1761,20 @@ struct Engine {
             }
         }
         between();
+        if (lazy_fit) {   // as many slots as the VRAM free now holds (the sessions' estimate leaves room unused), at most S_alone
+            CK(cudaDeviceSynchronize());
+            size_t fr = 0, tot = 0, per = 0, tails = 0;
+            CK(cudaMemGetInfo(&fr, &tot));
+            for (size_t li = 0; li < hy.size(); ++li) {
+                const Layer& L = layer_at((int) li);
+                if (hy[li].slot_of.empty() || L.n_slots >= ne) continue;
+                per += L.stride;
+                tails += kMmqTail;
+            }
+            const size_t keep = lazy_reserve + tails;
+            const int fit = per ? (int) std::min<size_t>((size_t) (ne - 1), fr > keep ? (fr - keep) / per : 0) : S;
+            S = std::max(0, std::min(S_alone, fit));
+        }
         for (size_t li = 0; li < hy.size(); ++li) {
             Layer& L = const_cast<Layer&>(layer_at((int) li));
             Hy& H = hy[li];
@@ -1783,6 +1802,7 @@ struct Engine {
             CK(cudaStreamSynchronize(st));   // (slot_of's host copy is pageable)
         }
         CK(cudaDeviceSynchronize());
+        return S;
     }
     /// After place_experts: the slot counts alone and with every session (false: the sessions do not fit even then).
     bool lazy_plan(std::string& err) {
@@ -1822,6 +1842,11 @@ struct Engine {
             return false;
         }
         if (const char* v = std::getenv("STRATA_Q36_LAZY_GRACE")) lazy_grace_s = std::max(0.0, std::atof(v));
+        if (const char* v = std::getenv("STRATA_Q36_LAZY_FIT")) lazy_fit = *v == '1';
+        if (const char* v = std::getenv("STRATA_Q36_LAZY_RESERVE_MIB")) lazy_reserve = (size_t) std::max(128, std::atoi(v)) << 20;
+        if (lazy_fit)
+            std::fprintf(stderr, "strata-q36: --batch-lazy: slots fitted to the free VRAM at each resize (%zu MiB kept free)\n",
+                         lazy_reserve >> 20);
         std::fprintf(stderr, "strata-q36: --batch-lazy: %d expert slots per layer alone, %d with all %d sessions (%.2f GiB "
                      "each); back to alone %.0f s after the last admission\n", S_alone, S_grown, n_sess,
                      (double) sess_bytes / (1 << 30), lazy_grace_s);
@@ -1866,8 +1891,7 @@ struct Engine {
         sess[(size_t) cur].pos = pos;
         reset_graphs();
         const int n = n_allocated() + 1;
-        const int S = slots_for(n);
-        resize_slots(S, [&] { alloc_session(sess[(size_t) b]); });
+        const int S = resize_slots(slots_for(n), [&] { alloc_session(sess[(size_t) b]); });
         upload_tabs();
         grown = true;
         ++lazy_grows;
@@ -1884,14 +1908,14 @@ struct Engine {
         cur = 0;
         load_cur();
         reset_graphs();
-        resize_slots(S_alone, [&] {
+        const int S = resize_slots(S_alone, [&] {
             for (int i = 1; i < n_sess; ++i) free_session(sess[(size_t) i]);
         });
         upload_tabs();
         grown = false;
         ++lazy_shrinks;
         std::fprintf(stderr, "strata-q36: lazy: alone again: session %d kept as 0, %d expert slots per layer, in %.0f ms\n",
-                     keep, S_alone, ms_since(t0));
+                     keep, S, ms_since(t0));
         report_experts(false);
     }
 
