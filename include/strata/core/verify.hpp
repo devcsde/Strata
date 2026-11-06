@@ -222,6 +222,10 @@ public:
     // Greedy only, no drafts (MTP) in a batch window.  `init_slots` once after `init` (S <= max_t); a layer
     // split's stages each get their own sessions, and run_slots/commit_slots continue into the next stage.
     bool init_slots(const std::vector<SessionState*>& slots, std::string& err);
+    /// STRATA_BATCH_LAZY_MAIN: slot `slot` decodes in session `s` from now on (carved like the others).  The batch
+    /// graphs captured the old sessions' addresses, so they all go (captured again at the next windows).  Call it
+    /// with no window in flight.
+    bool set_slot_session(int slot, SessionState* s, std::string& err);
     int n_slots() const { return (int) slots_.size(); }
     /// One batch window over slots [0, S): tokens[s] at positions pos[s]; out[s] = the greedy pick after it.
     bool run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user, int32_t* out,

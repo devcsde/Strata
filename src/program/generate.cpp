@@ -6112,6 +6112,10 @@ int main(int argc, char** argv) {
         return n;
     };
     std::vector<std::vector<std::unique_ptr<strata::core::SessionState>>> bslot_ss;
+    // the session each slot decodes in on the first stage (bslot_ss[0][b], or with STRATA_BATCH_LAZY_MAIN the main
+    // session for one of them: it changes as conversations move, see lazy_main below)
+    std::vector<strata::core::SessionState*> slot_phys;
+    bool lazy_main = false;   // STRATA_BATCH_LAZY_MAIN: one slot fewer carved; the main session serves as the last one
     if (o.batch != 0) {
         const int cap = strata::kernels::kVerifyMaxT;
         const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
@@ -7299,8 +7303,18 @@ int main(int argc, char** argv) {
     // valid.  The RoPE table is the main session's: nothing else keeps it safe while experts fill the tail.
     int64_t batch_lazy_keep = 0;     // the slots left to experts while the slots are in use
     if (batch_lazy) {
+        // STRATA_BATCH_LAZY_MAIN=1 (opt-in): N slots carve N-1 sessions; the main session is the N-th slot's.  While
+        // the slots are in use the main session only reads prompts (an admission's, then it moves on into a slot), so
+        // with every slot carved it held a third 128K state for nothing.  A conversation that decodes in it moves into
+        // a carved session before the next request reads there (lazy_main_evacuate).
+        if (const char* lm = std::getenv("STRATA_BATCH_LAZY_MAIN"); lm != nullptr && lm[0] == '1') {
+            if (o.kv_grow) std::fprintf(stderr, "strata generate: STRATA_BATCH_LAZY_MAIN is off: not with --kv-grow\n");
+            else if (o.batch < 2) std::fprintf(stderr, "strata generate: STRATA_BATCH_LAZY_MAIN is off: it needs 2 or more slots\n");
+            else lazy_main = true;
+        }
+        const int n_carve = lazy_main ? o.batch - 1 : o.batch;
         const uint64_t stride = (strata::core::session_bytes(g, o.max_context, K) + 4095) & ~(uint64_t) 4095;
-        const int64_t need = (int64_t) stride * o.batch;
+        const int64_t need = (int64_t) stride * n_carve;
         const int64_t from = (xcache.valid() ? xcache.full_bytes() - need : 0) & ~((int64_t) (1 << 20) - 1);
         batch_lazy_keep = from > 0 ? xcache.slots_within(from) : 0;
         if (batch_lazy_keep < 512) {
@@ -7312,9 +7326,10 @@ int main(int argc, char** argv) {
             batch_mtp = false;
             o.batch = 0;
             batch_lazy = false;
+            lazy_main = false;
         } else {
             const strata::core::QsaState* rope = g.n_qsa_layers() > 0 ? &ss.qsa_states[ss.qsa_ord0] : nullptr;
-            for (int b = 0; b < o.batch; ++b) {
+            for (int b = 0; b < n_carve; ++b) {
                 auto u = std::make_unique<strata::core::SessionState>();
                 if (strata::core::session_init(g, o.max_context, K, xcache.device_slot(0) + from + (int64_t) stride * b, *u,
                                                0, -1, rope) == 0) {
@@ -7324,10 +7339,18 @@ int main(int argc, char** argv) {
                 if (batch_mtp) slot_mtp[(size_t) b]->set_ple_session(u.get());
                 bslot_ss[0].push_back(std::move(u));
             }
+            slot_phys.clear();
+            for (auto& u : bslot_ss[0]) slot_phys.push_back(u.get());
+            if (lazy_main) {
+                slot_phys.push_back(&ss);
+                if (batch_mtp) slot_mtp[(size_t) (o.batch - 1)]->set_ple_session(&ss);
+            }
             cudaDeviceSynchronize();
-            std::fprintf(stderr, "strata generate: --batch %d on demand: the slot sessions (%.2f GiB each) use the expert "
-                                 "cache's tail only while slots are in use: %lld slots then, %lld otherwise\n", o.batch,
-                         (double) stride / 1073741824.0, (long long) batch_lazy_keep, (long long) xcache.full_slots());
+            std::fprintf(stderr, "strata generate: --batch %d on demand: %d slot sessions (%.2f GiB each) use the expert "
+                                 "cache's tail only while slots are in use: %lld slots then, %lld otherwise%s\n", o.batch,
+                         n_carve, (double) stride / 1073741824.0, (long long) batch_lazy_keep,
+                         (long long) xcache.full_slots(),
+                         lazy_main ? "; the main session is the last slot's (STRATA_BATCH_LAZY_MAIN)" : "");
         }
     }
     // ---- R4.2e: fill the tier from the profile.  This is the only place the plan is applied, and it runs
@@ -10275,16 +10298,24 @@ int main(int argc, char** argv) {
         if (batch_lazy && src.complement_ready()) {
             std::fprintf(stderr, "strata serve: WARNING: STRATA_BATCH_LAZY: not with the resident low-RAM mode; --batch is off\n");
             bslot_ss.clear();
+            slot_phys.clear();
             slot_mtp.clear();
             batch_mtp = false;
             o.batch = 0;
             batch_lazy = false;
+            lazy_main = false;
         }
         // each stage's verifier gets its stage's slot sessions
         if (o.batch > 0) {
+            if (!lazy_main) {   // (lazy_main: set at the carve)
+                slot_phys.clear();
+                if (!bslot_ss.empty())
+                    for (auto& u : bslot_ss[0]) slot_phys.push_back(u.get());
+            }
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 std::vector<strata::core::SessionState*> ptrs;
-                for (auto& u : bslot_ss[k]) ptrs.push_back(u.get());
+                if (k == 0) ptrs = slot_phys;
+                else for (auto& u : bslot_ss[k]) ptrs.push_back(u.get());
                 strata::core::Verifier& vk = k == 0 ? ver : stages[k - 1]->ver;
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (!vk.init_slots(ptrs, err)) {
@@ -12736,6 +12767,17 @@ int main(int argc, char** argv) {
             const char* v = std::getenv("STRATA_SLOT_COPY_DIRECT");
             return v != nullptr && v[0] != '\0' && v[0] != '0';
         }();
+        // slot b's session on stage k (stage 0: slot_phys, which STRATA_BATCH_LAZY_MAIN changes)
+        auto slot_sess = [&](size_t k, int b) -> strata::core::SessionState& {
+            return k == 0 ? *slot_phys[(size_t) b] : *bslot_ss[k][(size_t) b];
+        };
+        // STRATA_BATCH_LAZY_MAIN: the slot whose session is the main one now (-1: none)
+        auto main_slot = [&]() -> int {
+            if (!lazy_main) return -1;
+            for (size_t b = 0; b < slot_phys.size(); ++b)
+                if (slot_phys[b] == &ss) return (int) b;
+            return -1;
+        };
         auto direct_slot_copy = [&](bool into_slot, int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
             auto sync_all = [&]() {
@@ -12754,7 +12796,7 @@ int main(int argc, char** argv) {
             const bool queued = slot_copy_batchsync_env();
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 strata::core::SessionState& main_ss = k == 0 ? ss : stages[k - 1]->ss;
-                strata::core::SessionState& slot_ss = *bslot_ss[k][(size_t) b];
+                strata::core::SessionState& slot_ss = slot_sess(k, b);
                 strata::core::SessionState& from = into_slot ? main_ss : slot_ss;
                 strata::core::SessionState& to = into_slot ? slot_ss : main_ss;
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
@@ -12773,12 +12815,17 @@ int main(int argc, char** argv) {
             // the running state and the K/V of the Metal window, not the session's device buffers
             return strata::metal_engine::window_slot_copy_main(true, b, upto, false, e);
 #endif
-            if (slot_copy_direct) {
+            if (&slot_sess(0, b) == &ss) {
+                // STRATA_BATCH_LAZY_MAIN: the slot's session is the main one, which holds the prompt already; the
+                // background copies that read it (STRATA_CKPT_ASYNC, STRATA_PARK_ASYNC) land before the slot writes it
+                strata::core::conversation_checkpoint_join(nullptr);
+                strata::core::conversation_park_join();
+            } else if (slot_copy_direct) {
                 if (!direct_slot_copy(true, b, ids, e)) return false;
             } else
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 strata::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
-                strata::core::SessionState& to = *bslot_ss[k][(size_t) b];
+                strata::core::SessionState& to = slot_sess(k, b);
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
                 strata::core::ConversationCheckpoint ck;
@@ -12824,11 +12871,15 @@ int main(int argc, char** argv) {
             if (!strata::metal_engine::window_slot_copy_main(false, b, upto, at != nullptr, e)) return false;
             return at == nullptr || strata::core::conversation_checkpoint_restore(*at, ss, g, e);   // (the checkpoint's running state)
 #endif
-            if (slot_copy_direct && at == nullptr) {
+            if (&slot_sess(0, b) == &ss) {
+                // STRATA_BATCH_LAZY_MAIN: the slot's session is the main one: its cells are there already; only a
+                // checkpoint's running state comes back (the cells below it are the slot's)
+                if (at != nullptr && !strata::core::conversation_checkpoint_restore(*at, ss, g, e)) return false;
+            } else if (slot_copy_direct && at == nullptr) {
                 if (!direct_slot_copy(false, b, bs[(size_t) b].ids, e)) return false;
             } else
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
-                strata::core::SessionState& from = *bslot_ss[k][(size_t) b];
+                strata::core::SessionState& from = slot_sess(k, b);
                 strata::core::SessionState& to = k == 0 ? ss : stages[k - 1]->ss;
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
@@ -12911,7 +12962,7 @@ int main(int argc, char** argv) {
             }
             const size_t n_st = stages.size();
             static const std::vector<ImgKey> no_imgs;
-            ParkSource src{sl.ids, no_imgs, sl.checks, sl.cvec, *bslot_ss[0][(size_t) b], {},
+            ParkSource src{sl.ids, no_imgs, sl.checks, sl.cvec, slot_sess(0, b), {},
                            (n_st > 0 && !mtp_first) || !batch_mtp ? nullptr : &slot_mtp[(size_t) b]->kv_state(),
                            batch_mtp && !mtp_first && n_st > 0 ? &slot_mtp[(size_t) b]->kv_state() : nullptr, false,
                            " from slot " + std::to_string(b)};
@@ -12929,6 +12980,55 @@ int main(int argc, char** argv) {
             }
         };
         lazy_park = park_slot;
+        // STRATA_BATCH_LAZY_MAIN: a slot left with nothing it holds (its checkpoints back to the pool)
+        auto slot_forget = [&](int b) {
+            BSlot& sl = bs[(size_t) b];
+            if (ckpt_pool.on())
+                for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
+            sl = BSlot{};
+        };
+        // STRATA_BATCH_LAZY_MAIN: before a request reads in the main session, the slot decoding there (if any) moves into
+        // the carved session of a slot that is not decoding: its cells and running state are copied device to device, the
+        // two slots trade sessions, and the batch graphs are captured again.  The main session keeps what it held (the
+        // moved conversation, whose checkpoints stay valid below its prompt), but not as its live state.
+        auto lazy_main_evacuate = [&](std::string& e) -> bool {
+            const int a = main_slot();
+            if (a < 0 || !bs[(size_t) a].active) return true;
+            int m = -1;
+            if (admit_slot >= 0 && admit_slot != a && !bs[(size_t) admit_slot].active) m = admit_slot;   // overwritten anyway
+            for (int b = 0; m < 0 && b < (int) bs.size(); ++b)
+                if (b != a && !bs[(size_t) b].active && !bs[(size_t) b].cached) m = b;
+            for (int b = 0; m < 0 && b < (int) bs.size(); ++b)
+                if (b != a && !bs[(size_t) b].active) m = b;
+            if (m < 0) { e = "every slot is decoding, one of them in the main session"; return false; }
+            if (!lazy_quiesce(e)) return false;
+            const auto t0 = Clock::now();
+            park_slot(m);   // what it holds goes to the parked conversations first, as at an admission
+            slot_forget(m);
+            strata::core::SessionState& to = *slot_phys[(size_t) m];
+            const std::vector<int32_t>& held = bs[(size_t) a].ids;
+            const int64_t upto = (int64_t) held.size();
+            if (!strata::core::conversation_checkpoint_copy(ss, to, held, g, e, false)) return false;
+            for (int64_t j = 0; j < ss.qsa_alloc; ++j)
+                if (!strata::core::conversation_kv_copy(ss.qsa_states[ss.qsa_ord0 + j], to.qsa_states[to.qsa_ord0 + j], g,
+                                                        upto, true, e, false))
+                    return false;
+            if (cudaDeviceSynchronize() != cudaSuccess) {
+                e = std::string("moving a slot out of the main session: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            std::swap(slot_phys[(size_t) a], slot_phys[(size_t) m]);
+            if (!ver.set_slot_session(a, slot_phys[(size_t) a], e) || !ver.set_slot_session(m, slot_phys[(size_t) m], e))
+                return false;
+            if (batch_mtp) {
+                slot_mtp[(size_t) a]->set_ple_session(slot_phys[(size_t) a]);
+                slot_mtp[(size_t) m]->set_ple_session(slot_phys[(size_t) m]);
+            }
+            live_ok = false;
+            std::fprintf(stderr, "strata batch: slot %d moves out of the main session into slot %d's (%lld tokens, %.1f ms)\n",
+                         a, m, (long long) upto, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+            return true;
+        };
         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
         // so it keeps the conversation it holds
         auto batch_step = [&]() -> bool {
@@ -13743,6 +13843,16 @@ int main(int argc, char** argv) {
                 Clock::now() - profile_saved_at >= std::chrono::duration<double>(o.expert_profile_save_min * 60.0))
                 save_profile("periodic");
             if (line == "QUIT") break;
+            if (lazy_main && lazy_active) {   // STRATA_BATCH_LAZY_MAIN: the main session free for this line's read
+                std::string ee;
+                if (!lazy_main_evacuate(ee)) {
+                    std::fprintf(stderr, "strata batch: %s\n", ee.c_str());
+                    std::printf("ERR %s%s\n", admit_slot >= 0 ? "BGEN: " : "", ee.c_str());
+                    std::fflush(stdout);
+                    admit_slot = -1;
+                    continue;
+                }
+            }
             // the watchdog watches a request from here until this iteration ends, whichever way it ends
             struct BusyScope {
                 BusyScope() {
@@ -14585,6 +14695,14 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+            // STRATA_BATCH_LAZY_MAIN: an idle slot whose session is the main one is overwritten by this request: what it
+            // holds is parked first (unless this request continues it: the copy back below then finds its cells in place),
+            // and after that the slot holds nothing
+            const int lm_slot = lazy_main ? main_slot() : -1;
+            if (lm_slot >= 0 && !bs[(size_t) lm_slot].active && slot_source != lm_slot) {
+                park_slot(lm_slot);
+                slot_forget(lm_slot);
+            }
             if (slot_source >= 0) {
                 lent_slot = -1;   // (a longer start than the main session's)
                 const auto t0 = Clock::now();
@@ -14673,6 +14791,8 @@ int main(int argc, char** argv) {
                                  slot_ck != nullptr ? "its turn checkpoint" : "all it holds",
                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                 }
+                // STRATA_BATCH_LAZY_MAIN: its session is the main one, which this request goes on writing
+                if (slot_source == lm_slot && !bs[(size_t) lm_slot].active) slot_forget(lm_slot);
             }
             // STRATA_BATCH_LAZY: no slot in use for the grace time: the tail goes back to the experts, after the slot this
             // request continues from (if any) gave its conversation back above and before this request reads its prompt.
@@ -15367,7 +15487,7 @@ int main(int argc, char** argv) {
                     std::vector<const CoReq*> used;
                     for (const CoReq& c : co_set) {
                         if (c.slot < 0 || c.slot >= (int) bs.size() || c.slot == admit_slot || bs[(size_t) c.slot].active ||
-                            bs[(size_t) c.slot].partial)
+                            bs[(size_t) c.slot].partial || c.slot == main_slot())   // (LAZY_MAIN: this read's own session)
                             continue;
                         bool dup = false;
                         for (const CoReq* u : used) dup = dup || u->slot == c.slot;
@@ -15376,7 +15496,7 @@ int main(int argc, char** argv) {
                         sg.tokens = c.ids.data();
                         sg.n = (int64_t) c.ids.size() - 1;   // (the last token goes through the slot's own first window)
                         sg.pos0 = 0;
-                        for (size_t k = 0; k < bslot_ss.size(); ++k) sg.stage_ss.push_back(bslot_ss[k][(size_t) c.slot].get());
+                        for (size_t k = 0; k < bslot_ss.size(); ++k) sg.stage_ss.push_back(&slot_sess(k, c.slot));
                         segs.push_back(sg);
                         used.push_back(&c);
                     }
@@ -15385,7 +15505,7 @@ int main(int argc, char** argv) {
                         park_slot(c->slot);   // the conversation the slot holds, before this read overwrites it
                         for (size_t k = 0; k < bslot_ss.size(); ++k) {
                             const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
-                            strata::core::session_zero(*bslot_ss[k][(size_t) c->slot], g, nullptr, nullptr);
+                            strata::core::session_zero(slot_sess(k, c->slot), g, nullptr, nullptr);
                             cudaDeviceSynchronize();
                         }
                         bs[(size_t) c->slot] = BSlot{};   // (it holds nothing until the read is done)
@@ -15512,7 +15632,9 @@ int main(int argc, char** argv) {
                 // text only, and into a slot that is not decoding.
                 auto give_way = [&](int ys, int64_t q, std::string& err) -> bool {
                     // (STRATA_BATCH_LAZY: while the slots are off their sessions' memory holds experts and this read's loan)
+                    // (STRATA_BATCH_LAZY_MAIN: not into the slot whose session is the main one - the next read overwrites it)
                     const bool can = ys < (int) bs.size() && !bs[(size_t) ys].active && (!batch_lazy || lazy_active) &&
+                                     ys != main_slot() &&
                                      (admit_slot < 0 || ys == admit_slot) && req_imgs.empty() && o.prompt_cache > 0 &&
                                      b0 - q > std::max<int64_t>(C_read, o.short_read);
                     std::string ye;
@@ -17544,6 +17666,9 @@ int main(int argc, char** argv) {
                     bs[(size_t) admit_slot].cached = false;   // its sessions may be half written
                     cont = false;
                 }
+                // STRATA_BATCH_LAZY_MAIN: the slot decodes on in the main session, so that is no longer this prompt's
+                // live state (its checkpoints stay: the slot writes the cells from the prompt's end on)
+                if (cont && &slot_sess(0, admit_slot) == &ss) live_ok = false;
                 const auto tc1 = Clock::now();
                 if (cont) {
                     ver.set_slot_sampling(admit_slot, req_sp);   // the request's own sampling, row by row

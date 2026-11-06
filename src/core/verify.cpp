@@ -3741,6 +3741,31 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     return true;
 }
 
+bool Verifier::set_slot_session(int slot, SessionState* s, std::string& err) {
+    const OnDevice on_device(device_);
+    if (slot < 0 || slot >= (int) slots_.size() || s == nullptr) { err = "verify: set_slot_session: no such slot"; return false; }
+    if (s->layer_lo != ss_->layer_lo || s->layer_hi != ss_->layer_hi || s->max_cells != ss_->max_cells ||
+        s->gdn_ord0 != ss_->gdn_ord0 || s->qsa_ord0 != ss_->qsa_ord0) {
+        err = "verify: set_slot_session: the session is not carved like the stage's own";
+        return false;
+    }
+    if (slots_[(size_t) slot] == s) return true;
+#if !defined(STRATA_GPU_METAL)
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = std::string("verify: set_slot_session: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    for (auto* m : {&exec_bm_, &commit_bm_, &save_bm_, &dcommit_bm_}) {
+        for (auto& kv : *m)
+            if (kv.second) cudaGraphExecDestroy(kv.second);
+        m->clear();
+    }
+    bm_used_.clear();
+#endif
+    slots_[(size_t) slot] = s;
+    return true;
+}
+
 bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err) {
     cudaGraphExec_t& ex = exec_bm_[bkey(rows, S, hbase)];
     if (ex != nullptr) return true;
