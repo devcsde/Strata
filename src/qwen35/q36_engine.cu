@@ -1827,6 +1827,26 @@ struct Engine {
                      (double) sess_bytes / (1 << 30), lazy_grace_s);
         return true;
     }
+    /// INFO expert_slots / experts / expert_cache_mib (the Monitor's "Experts in VRAM"): at the start, and with
+    /// STRATA_LIVE_INFO=1 (a server that takes INFO lines between requests) after every --batch-lazy resize.
+    void report_experts(bool at_start) const {
+        static const bool live = [] { const char* v = std::getenv("STRATA_LIVE_INFO"); return v && *v == '1'; }();
+        if (!at_start && !live) return;
+        const int64_t ne = m->g.n_expert;
+        const int nl = (int) m->layers.size() + (m->has_mtp ? 1 : 0);
+        long long slots = 0, total = 0;
+        double bytes = 0;
+        for (int li = 0; li < nl; ++li) {
+            const Layer& L = layer_at(li);
+            const int64_t n = m->hybrid ? std::min<int64_t>(ne, std::max(0, L.n_slots)) : ne;
+            slots += n;
+            total += ne;
+            bytes += (double) n * (double) L.stride;
+        }
+        std::printf("INFO expert_slots=%lld experts=%lld expert_cache_mib=%lld\n", slots, total,
+                    (long long) (bytes / 1048576.0));
+        std::fflush(stdout);
+    }
     int n_allocated() const {
         int n = 0;
         for (const Sess& ss : sess) n += ss.conv.empty() ? 0 : 1;
@@ -1853,6 +1873,7 @@ struct Engine {
         ++lazy_grows;
         std::fprintf(stderr, "strata-q36: lazy: session %d allocated (%d of %d), %d expert slots per layer, in %.0f ms\n", b,
                      n, n_sess, S, ms_since(t0));
+        report_experts(false);
     }
     /// Alone again: session `keep`'s conversation moves to session 0, the others are freed, the slots grow back.
     void shrink(int keep) {
@@ -1871,6 +1892,7 @@ struct Engine {
         ++lazy_shrinks;
         std::fprintf(stderr, "strata-q36: lazy: alone again: session %d kept as 0, %d expert slots per layer, in %.0f ms\n",
                      keep, S_alone, ms_since(t0));
+        report_experts(false);
     }
 
     /// The current session: `i`'s state, cache and position become the engine's (conv / S / kc / vc / pos / hlast).
@@ -4365,6 +4387,7 @@ struct Serve {
 
     int run() {
         if (E.n_sess > 1) std::printf("INFO batch_slots=%d slot_cache=1\n", E.n_sess);
+        E.report_experts(true);
         std::printf("READY %d stop\n", E.ctx);
         std::fflush(stdout);
         std::thread reader([&] {
