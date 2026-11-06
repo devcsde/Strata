@@ -1713,6 +1713,12 @@ struct Engine {
     // instead of the estimate's S_grown - the estimate leaves ~1-2 GiB unused with every session allocated
     bool lazy_fit = false;
     size_t lazy_reserve = (size_t) 768 << 20;
+    // STRATA_Q36_LAZY_IDLE=<s> (0 = off): more than two sessions allocated, but never all of them in use for that long:
+    // one is freed (the shortest idle conversation's) and its room goes back to the experts - a third request now and
+    // then leaves the two that follow it with the slots of two, not three.  Down to alone stays lazy_grace_s's.
+    double lazy_idle_s = 0.0;
+    Clock::time_point lazy_full{};   // the last moment every allocated session was in use (or one was allocated)
+    long long lazy_trims = 0;
 
     void free_session(Sess& ss) const {
         for (auto* v : {&ss.conv, &ss.S, &ss.kc, &ss.vc}) {
@@ -1844,6 +1850,10 @@ struct Engine {
         if (const char* v = std::getenv("STRATA_Q36_LAZY_GRACE")) lazy_grace_s = std::max(0.0, std::atof(v));
         if (const char* v = std::getenv("STRATA_Q36_LAZY_FIT")) lazy_fit = *v == '1';
         if (const char* v = std::getenv("STRATA_Q36_LAZY_RESERVE_MIB")) lazy_reserve = (size_t) std::max(128, std::atoi(v)) << 20;
+        if (const char* v = std::getenv("STRATA_Q36_LAZY_IDLE")) lazy_idle_s = std::max(0.0, std::atof(v));
+        if (lazy_idle_s > 0 && n_sess > 2)
+            std::fprintf(stderr, "strata-q36: --batch-lazy: a session beyond two is given back after %.0f s without all of "
+                         "them in use\n", lazy_idle_s);
         if (lazy_fit)
             std::fprintf(stderr, "strata-q36: --batch-lazy: slots fitted to the free VRAM at each resize (%zu MiB kept free)\n",
                          lazy_reserve >> 20);
@@ -2032,10 +2042,59 @@ struct Engine {
         const int S = resize_slots(slots_for(n), [&] { alloc_session(sess[(size_t) b]); });
         upload_tabs();
         grown = true;
+        lazy_full = Clock::now();
         ++lazy_grows;
         std::fprintf(stderr, "strata-q36: lazy: session %d allocated (%d of %d), %d expert slots per layer, in %.0f ms\n", b,
                      n, n_sess, S, ms_since(t0));
         report_experts(false);
+    }
+    /// `busy` sessions in use now: all of the allocated ones restarts the lazy_idle_s clock.
+    void note_busy(int busy) {
+        if (lazy && busy >= n_allocated()) lazy_full = Clock::now();
+    }
+    /// STRATA_Q36_LAZY_IDLE: with more than two sessions allocated and not all of them in use for lazy_idle_s, one idle
+    /// session is freed (never `protect`, nor one decoding): the one holding the shortest conversation; when that is
+    /// session 0 (always allocated), another idle session's conversation moves into it and that one is freed.
+    /// -> the freed session, or -1.
+    int trim_idle(int protect) {
+        if (!lazy || !grown || lazy_idle_s <= 0 || n_allocated() <= 2 ||
+            std::chrono::duration<double>(Clock::now() - lazy_full).count() < lazy_idle_s)
+            return -1;
+        const auto t0 = Clock::now();
+        auto idle = [&](int i) { const Sess& s = sess[(size_t) i]; return !s.conv.empty() && !s.active && i != protect; };
+        int c = -1;
+        for (int i = 0; i < n_sess; ++i) {
+            if (!idle(i)) continue;
+            const Sess& s = sess[(size_t) i];
+            if (c < 0 || s.live.size() < sess[(size_t) c].live.size() ||
+                (s.live.size() == sess[(size_t) c].live.size() && s.used < sess[(size_t) c].used))
+                c = i;
+        }
+        int v = c;
+        if (c == 0) {
+            v = -1;
+            for (int i = 1; i < n_sess && v < 0; ++i)
+                if (idle(i)) v = i;
+            if (v >= 0) copy_session(v, 0);
+        }
+        if (v <= 0) { lazy_full = Clock::now(); return -1; }   // (nothing to give now: look again a while later)
+        const size_t dropped = c == 0 ? sess[0].live.size() : sess[(size_t) v].live.size();
+        sess[(size_t) cur].pos = pos;
+        if (cur == v) {
+            cur = 0;
+            load_cur();
+        }
+        reset_graphs();
+        const int n = n_allocated() - 1;
+        const int S = resize_slots(slots_for(n), [&] { free_session(sess[(size_t) v]); });
+        upload_tabs();
+        lazy_full = Clock::now();
+        ++lazy_trims;
+        std::fprintf(stderr, "strata-q36: lazy: session %d given back after %.0f s idle (%d of %d now, a conversation of %zu "
+                     "tokens dropped%s), %d expert slots per layer, in %.0f ms\n", v, lazy_idle_s, n, n_sess, dropped,
+                     c == 0 ? ", session 0's" : "", S, ms_since(t0));
+        report_experts(false);
+        return v;
     }
     /// Alone again: session `keep`'s conversation moves to session 0, the others are freed, the slots grow back.
     void shrink(int keep) {
@@ -4368,6 +4427,10 @@ struct Serve {
         // ---- --batch-lazy: an admission needs every session; a request alone, long enough after the last admission,
         // gives their room back to the experts (its conversation, if a session holds it, moves to session 0)
         if (E.lazy) {
+            // an idle session beyond two goes first (not the one this request takes, nor any when it needs a new one)
+            if (!adm) E.trim_idle(pick_session(ids, ir.imgs));
+            else if (!E.sess[(size_t) slot].conv.empty()) E.trim_idle(slot);
+            E.note_busy(n_active + 1);
             if (adm) {
                 E.grow_slot(slot);
                 E.last_admit = Clock::now();
@@ -4600,7 +4663,14 @@ struct Serve {
                     return 0;
                 }
             }
-            if (!have) { window(); continue; }
+            if (!have) {
+                if (E.lazy && E.lazy_idle_s > 0) {   // (cheap: three sessions and a clock)
+                    E.note_busy(n_active);
+                    E.trim_idle(-1);
+                }
+                window();
+                continue;
+            }
             if (line.empty()) continue;
             if (line.rfind("BSTOP ", 0) == 0) {
                 const int b = std::atoi(line.c_str() + 6);
