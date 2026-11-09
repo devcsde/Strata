@@ -737,6 +737,12 @@ class Event:
 THINK_END = "</think>"
 CALL_START = "<tool_call>"
 CALL_END = "</tool_call>"
+# local fix 2026-11-09 (Rakazo): a request that declares `use_tool` (Rakazo's bridge to its deferred built-in tools such as
+# message_bot) gets a direct call of an undeclared tool as use_tool(name=..., arguments={...}) instead of the call going
+# back as text.  STRATA_USE_TOOL_WRAP=0 turns it off.
+USE_TOOL_NAME = "use_tool"
+USE_TOOL_WRAP = os.environ.get("STRATA_USE_TOOL_WRAP", "1") != "0"
+_WRAP_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.\-]{0,79}")
 
 
 PARAM_END = "</parameter>"
@@ -1128,6 +1134,7 @@ class OutputParser:
                         if len(names) == 1 and alias not in self.schemas}
         self.unread = 0              # #3441: `<tool_call>` blocks that opened like a call and were returned as text
         self.unread_names: list[str] = []   # the names (first few) of those that named a tool the request did not declare
+        self.wrapped: list[str] = []        # local fix (Rakazo): undeclared calls sent as use_tool
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
         # soon as the name is known, then "tool_args" pieces of its JSON arguments (string parameters character by
         # character; other types whole, once complete) - before the final "tool_call".  Without it, a client sees
@@ -1171,7 +1178,13 @@ class OutputParser:
         none declared, only where `declared_only` is off."""
         if not self.schemas:
             return not self.declared_only
-        return name in self.schemas or name in self.aliases
+        return name in self.schemas or name in self.aliases or self._wrap_name(name)
+
+    def _wrap_name(self, name: str) -> bool:
+        """local fix (Rakazo): `name` is undeclared, but the request declares use_tool -> the call goes out as use_tool."""
+        return (USE_TOOL_WRAP and USE_TOOL_NAME in self.schemas and name not in self.schemas
+                and name not in self.aliases and name not in (USE_TOOL_NAME, "find_tool")
+                and _WRAP_NAME.fullmatch(name or "") is not None)
 
     def _loose_open(self, after: str):
         """#3441: `after` (text after a `<tool_call>`, whitespace dropped) opens a call in a drifted form that names a
@@ -1405,6 +1418,8 @@ class OutputParser:
                 name = raw_name.strip()
                 name = self.aliases.get(name, name)
                 if raw_name != raw_name.strip() and name not in self.schemas:
+                    return out
+                if self._wrap_name(name):           # local fix: goes out whole as use_tool at its end, not streamed
                     return out
                 self.scall = ToolCall(name=name, arguments={})
                 props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
@@ -1876,6 +1891,9 @@ class OutputParser:
             self._reset_scan()
             self.state = "content"
             return [Event("content", self._track(body if bare else CALL_START + body + CALL_END))]
+        if self._wrap_name(name):                   # local fix (Rakazo): message_bot(...) -> use_tool(name=message_bot, ...)
+            call = ToolCall(name=USE_TOOL_NAME, arguments={"name": name, "arguments": call.arguments}, id=call.id)
+            self.wrapped.append(name)
         if self.scall is not None:
             call.id = self.scall.id
         self._reset_scan()

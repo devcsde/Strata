@@ -5966,6 +5966,11 @@ class Service:
         if getattr(parser, "notes", None):
             self.totals["tool_args_repaired"] = self.totals.get("tool_args_repaired", 0) + len(parser.notes)
             print(f"[strata] {len(parser.notes)} tool call argument(s) repaired: {'; '.join(sorted(set(parser.notes)))}", flush=True)
+        if getattr(parser, "wrapped", None):    # local fix 2026-11-09 (Rakazo)
+            print(f"[strata] {len(parser.wrapped)} call(s) of an undeclared tool sent as use_tool: "
+                  f"{', '.join(parser.wrapped[:5])}", flush=True)
+            with self.status_lock:
+                self.totals["tool_calls_use_tool_wrapped"] = self.totals.get("tool_calls_use_tool_wrapped", 0) + len(parser.wrapped)
         rejected = []
         if parser.unread:
             named = getattr(parser, "unread_names", None)
